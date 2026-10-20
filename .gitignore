@@ -1,0 +1,8 @@
+.venv/
+.env
+__pycache__/
+bench/tasks/
+bench/answers/
+bench/runs/
+dist/
+bench/results.csv
