@@ -8,7 +8,7 @@
 Что не эмулируем без Docker: лимит памяти (только меряем пик), отключение сети
 (агент обязан сам не ходить никуда, кроме OPENAI_BASE_URL).
 
-Переменные OPENAI_* берутся из окружения или из code/.env.
+Переменные OPENAI_* берутся из окружения, code/.env или .env каталогом выше.
 """
 
 import argparse
@@ -40,12 +40,14 @@ PASS_ENV = ("PATH", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "HOME",
 
 def load_env() -> dict:
     env = {k: os.environ[k] for k in PASS_ENV if k in os.environ}
-    dotenv = CODE / ".env"
-    if dotenv.exists():
+    for dotenv in (CODE / ".env", CODE.parent / ".env"):
+        if not dotenv.exists():
+            continue
         for line in dotenv.read_text(encoding="utf-8").splitlines():
             if "=" in line and not line.lstrip().startswith("#"):
                 key, value = line.split("=", 1)
-                env.setdefault(key.strip(), value.strip().strip('"'))
+                if value.strip():
+                    env.setdefault(key.strip(), value.strip().strip('"'))
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
@@ -60,8 +62,11 @@ def tree(proc: psutil.Process) -> list[psutil.Process]:
 def run(name: str, timeout: float, cpus: int, archive: Path) -> dict:
     run_dir = BENCH / "runs" / f"{name}_{datetime.now():%Y%m%d_%H%M%S}"
     shutil.copytree(BENCH / "tasks" / name, run_dir)
+    # Как платформа: в каталог задачи попадают только корневые .py и requirements.txt.
     with zipfile.ZipFile(archive) as zf:
-        zf.extractall(run_dir)
+        for member in zf.namelist():
+            if "/" not in member and (member.endswith(".py") or member == "requirements.txt"):
+                zf.extract(member, run_dir)
     task_md = run_dir / "task.md"
     log_path = run_dir / "run.log"
 
