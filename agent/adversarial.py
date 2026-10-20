@@ -37,7 +37,8 @@ def adversarial(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) ->
     y = np.r_[np.zeros(len(x_tr)), np.ones(len(x_te))]
     rng = np.random.default_rng(0)
     p = np.zeros(len(x))
-    gain = np.zeros(len(features))
+    # После prepare колонок может стать больше: дата раскладывается на части.
+    gain = np.zeros(x.shape[1])
     for fit, val in StratifiedKFold(3, shuffle=True, random_state=0).split(x, y):
         if len(fit) > MAX_ROWS:
             fit = rng.choice(fit, MAX_ROWS, replace=False)
@@ -46,6 +47,6 @@ def adversarial(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) ->
         gain += model.feature_importance("gain")
     auc = float(roc_auc_score(y, p))
     share = gain / max(gain.sum(), 1e-12)
-    top = sorted(zip(features, share.round(3)), key=lambda t: -t[1])[:5]
+    top = sorted(zip(x.columns, share.round(3)), key=lambda t: -t[1])[:5]
     log.info("adversarial: AUC %.3f, сдвинуты сильнее всего %s", auc, top)
     return AdversarialReport(auc, top, p[: len(x_tr)])
