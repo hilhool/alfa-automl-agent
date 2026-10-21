@@ -2,7 +2,7 @@
 
 Контекст для работы в этом каталоге. Главный проектный документ: `Проект_ ИИ-агент для разработки ML-моделей.md` (дальше «проектный md»). В нём план, обоснования со ссылками на статьи и журнал работ (раздел 11). Этот файл про другое: что надо знать до первой правки и где лежат ловушки.
 
-Состояние на 20.10.2026, вечер: ядро без LLM готово (история сущностей, веса классов, текст, даты, adversarial). Свежие цифры стенда в журнале проектного md, раздел «Этап 2–3». Блоки ниже про код и результаты частично устарели, сверяйся с журналом. Следующее: первый сабмит, LLM-цикл после ключей, тяжёлые модели.
+Состояние на 21.10.2026, вечер: ядро без LLM, зоопарк моделей (lgb, cat, xgb), словарь из 20 метрик, клиент LLM и цикл AutoResearch (`agent/llm.py`, `agent/research.py`). Сабмиты: 23,21 и 24,09. Свежие цифры стенда в журнале проектного md, раздел 11. Блоки ниже про код и результаты частично устарели, сверяйся с журналом.
 
 ## Правила работы в проекте
 
@@ -12,7 +12,7 @@
 - Git: корень репозитория — вся папка `хакатон/` (с 21.10, commit 15ab247; до этого корнем был `code/`). Репозиторий **публичный**, поэтому train/test/sample_submission CSV и `.env` в корневом `.gitignore`, в git только task.md и data_dictionary. Remote `https://hilhool@github.com/hilhool/alfa-automl-agent.git`, ветка main (создан 20.10, первый commit 942738a). Commit message короткий и по-английски, без Co-Authored-By, автор задан локально в `code/.git/config`: `hilhool <126339474+hilhool@users.noreply.github.com>`. Email из `~/.gitconfig-study` (hilhool011@gmail.com) GitHub привязывает к аккаунту timur2015png, поэтому для этого репозитория его перекрыли. `bench/results.csv` в .gitignore.
 - Сабмитов 3 в сутки, они дорогие. Сабмит делает пользователь, не ты. Перед любым сабмитом ZIP проходит проверку в чистом окружении (см. «Сборка ZIP»).
 - Ключ LLM для разработки стоит 600 ₽ в сутки на команду. Прогоны с LLM на стенде запускай осознанно и коротко, не в цикле «на всякий случай».
-- Ключи лежат в `code/.env` (OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL). Не печатай их, не коммить, не клади в ZIP. На 20.10 вечером ключей ещё нет: капитану обещали прислать письмом с alfafuture@cl-friends.com.
+- Ключ лежит в `хакатон/.env` (OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL). Не печатай его, не коммить, не клади в ZIP. Рассуждением Qwen управляет `extra_body={"reasoning": {...}}`, подробности в docstring `agent/llm.py`.
 
 ## Окружение
 
@@ -42,13 +42,15 @@
       spec.py     тип задачи, таргет, id, метрика правилами
       cv.py       выбор схемы валидации, фиксированные фолды
       metrics.py  метрики агента, направление, to_labels (закрыт от LLM)
-      core.py     LightGBM на фолдах + рефит
+      core.py     LightGBM/CatBoost/XGBoost на фолдах + рефит
+      llm.py      клиент LLM: JSON по схеме, ретраи, выключение после 4 неудач
+      research.py цикл гипотез LLM: признаки, песочница для кода, проверка утечек
     bench/                        локальный стенд (в ZIP НЕ идёт)
       make_tasks.py  собирает bench/tasks/* и bench/answers/*
       build_zip.py   собирает dist/solution.zip (solution.py + agent/*.py), проверяет состав
       run.py         прогон solution.py как на платформе, пишет results.csv
       metrics.py     RMSE, Macro F1, баллы по формулам кейса
-      llm_probe.py   проба возможностей API (ждёт ключей)
+      llm_probe.py   проба возможностей API
       tasks/ answers/ runs/ results.csv   артефакты, в .gitignore
     dist/                         собранный ZIP, в .gitignore
     .venv/                        Python 3.12 + requirements.txt
@@ -171,7 +173,7 @@ cd "/e/study/HSE/3 курс/хакатон/code/bench"
 ../.venv/Scripts/python.exe llm_probe.py                          # когда появятся ключи в code/.env
 ```
 
-`run.py` собирает ZIP (или берёт `--zip`), копирует `bench/tasks/<name>` в `bench/runs/<name>_<время>/`, распаковывает туда ZIP и запускает `python solution.py task.md` с cwd в этом каталоге, как платформа, привязывает процесс к 8 логическим ядрам, меряет пик RSS, по таймауту убивает всё дерево процессов, проверяет формат и считает метрику и балл по `answers/<name>.json`. Передаёт только PATH, SYSTEMROOT, TEMP, TMP, USERPROFILE, HOME и OPENAI_*, плюс `code/.env`. Лог прогона в `runs/<...>/run.log`, лог агента в `runs/<...>/agent.log`.
+`run.py` собирает ZIP (или берёт `--zip`), копирует `bench/tasks/<name>` в `bench/runs/<name>_<время>/`, распаковывает туда ZIP и запускает `python solution.py task.md` с cwd в этом каталоге, как платформа, привязывает процесс к 8 логическим ядрам, меряет пик RSS, по таймауту убивает всё дерево процессов, проверяет формат и считает метрику и балл по `answers/<name>.json`. Передаёт только PATH, SYSTEMROOT, TEMP, TMP, USERPROFILE, HOME, OPENAI_* и HTTP(S)_PROXY/NO_PROXY (без прокси провайдер режет API по SNI), плюс `code/.env` и `хакатон/.env`. Лог прогона в `runs/<...>/run.log`, лог агента в `runs/<...>/agent.log`.
 
 ## Сборка ZIP
 

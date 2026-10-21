@@ -9,20 +9,37 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-# Порядок важен: более специфичные шаблоны раньше общих.
+# Порядок важен: более специфичные шаблоны раньше общих (rmsle раньше rmse, qwk раньше kappa).
 METRIC_PATTERNS = [
-    ("f1_macro", r"macro[\s_-]*f1|f1[\s_-]*macro"),
-    ("f1_weighted", r"weighted[\s_-]*f1|f1[\s_-]*weighted"),
-    ("roc_auc", r"roc[\s_-]*auc|\bauc\b"),
-    ("logloss", r"log[\s_-]*loss|кросс-энтропи|cross[\s_-]*entropy"),
-    ("rmse", r"\brmse\b"),
-    ("mae", r"\bmae\b"),
-    ("r2", r"\br2\b|\br²"),
-    ("f1_binary", r"\bf1\b"),
-    ("accuracy", r"\baccuracy\b|доля верных"),
+    ("f1_macro", r"macro[\s_-]*f1|f1[\s_-]*macro|макро[\s_-]*f1|f1[\s_-]*макро|макро-?усредн"),
+    ("f1_weighted", r"weighted[\s_-]*f1|f1[\s_-]*weighted|взвешенн\w*[\s_-]*f1|f1[\s_-]*взвешенн"),
+    ("pr_auc", r"pr[\s_-]*auc|average[\s_-]*precision|precision[\s_-]*recall[\s_-]*curve|площад\w* под pr"),
+    ("gini", r"\bgini\b|джини"),
+    ("roc_auc", r"roc[\s_-]*auc|\bauc\b|площад\w* под roc|roc-крив"),
+    ("logloss", r"log[\s_-]*loss|кросс-?энтропи|cross[\s_-]*entropy|логистическ\w* функци\w* потерь"),
+    ("rmsle", r"\brmsle\b|root[\s_-]*mean[\s_-]*squared[\s_-]*log|среднеквадратичн\w* логарифм"),
+    ("msle", r"\bmsle\b|mean[\s_-]*squared[\s_-]*log"),
+    ("smape", r"\bsmape\b|symmetric[\s_-]*mean[\s_-]*absolute[\s_-]*percent|симметричн\w*.{0,20}процентн"),
+    ("mape", r"\bmape\b|mean[\s_-]*absolute[\s_-]*percent|процентн\w* ошибк"),
+    ("medae", r"median[\s_-]*absolute[\s_-]*error|медианн\w* абсолютн"),
+    ("mae", r"\bmae\b|mean[\s_-]*absolute[\s_-]*error|средн\w* абсолютн\w* (ошибк|отклонен)"),
+    ("rmse", r"\brmse\b|\bmse\b|root[\s_-]*mean[\s_-]*squared|mean[\s_-]*squared[\s_-]*error|"
+             r"среднеквадратичн\w* (ошибк|отклонен)|корень из средн"),
+    ("r2", r"\br2\b|\br²|r[\s_-]*squared|r\^2|коэффициент\w* детерминац"),
+    ("qwk", r"quadratic\w*[\s_-]*weighted[\s_-]*kappa|\bqwk\b|квадратичн\w* взвешенн\w* капп"),
+    ("kappa", r"cohen\W{0,2}s[\s_-]*kappa|\bkappa\b|капп[аы]"),
+    ("mcc", r"\bmcc\b|matthews|мэттьюс"),
+    ("balanced_accuracy", r"balanced[\s_-]*accuracy|сбалансированн\w* точност"),
+    ("f1_binary", r"\bf1\b|f-?мер|f1-?мер|f[\s_-]*score"),
+    ("accuracy", r"\baccuracy\b|доля верных|доля правильн|\bточност[ьи]\b"),
 ]
 DEFAULT_METRIC = {"regression": "rmse", "binary": "f1_binary", "multiclass": "f1_macro"}
-KIND_OF_METRIC = {"rmse": "regression", "mae": "regression", "r2": "regression"}
+REGRESSION_METRICS = ("rmse", "mae", "r2", "rmsle", "msle", "mape", "smape", "medae")
+KIND_OF_METRIC = {m: "regression" for m in REGRESSION_METRICS}
+# Метрики, которым нужны вероятности, а не метки (для binary).
+PROBA_METRICS = ("roc_auc", "gini", "pr_auc", "logloss")
+# Метрики только для binary: на мультиклассе заменяем ближайшей.
+BINARY_TO_MULTI = {"f1_binary": "f1_macro", "gini": "roc_auc", "pr_auc": "roc_auc"}
 
 
 @dataclass
@@ -63,12 +80,12 @@ def parse(task_text: str, train: pd.DataFrame, sample: pd.DataFrame) -> TaskSpec
     metric = found or DEFAULT_METRIC[kind]
     if (KIND_OF_METRIC.get(metric) == "regression") != (kind == "regression"):
         metric = DEFAULT_METRIC[kind]
-    if kind == "multiclass" and metric == "f1_binary":
-        metric = "f1_macro"
+    if kind == "multiclass":
+        metric = BINARY_TO_MULTI.get(metric, metric)
 
     classes = [] if kind == "regression" else sorted(y.unique().tolist(), key=str)
     # Вероятность пишем для binary, если метрика её требует и шаблон числовой (0/0.0).
     # Мультикласс с вероятностями в одну колонку не записать, там остаются метки.
-    proba = (kind == "binary" and metric in ("roc_auc", "logloss")
+    proba = (kind == "binary" and metric in PROBA_METRICS
              and pd.api.types.is_numeric_dtype(sample[target]))
     return TaskSpec(kind=kind, metric=metric, target=target, id_col=id_col, classes=classes, proba_output=proba)

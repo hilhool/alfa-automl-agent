@@ -34,8 +34,11 @@ BENCH = CODE / "bench"
 sys.path.insert(0, str(CODE))
 from agent.taskio import check_submission, locate  # noqa: E402
 
+# Прокси пробрасываем только на стенде: без него провайдер режет хост API по SNI,
+# и вызовы LLM падают с Connection error. На платформе своя сеть.
 PASS_ENV = ("PATH", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "HOME",
-            "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL")
+            "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL",
+            "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
 
 
 def load_env() -> dict:

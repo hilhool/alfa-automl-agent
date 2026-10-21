@@ -22,9 +22,11 @@ from agent.core import CoreResult, OutOfTime, run_core  # noqa: E402
 from agent.cv import Folds, make_folds  # noqa: E402
 from agent.ensemble import caruana, median_blend  # noqa: E402
 from agent.entity import add_history, add_lags, find_key  # noqa: E402
-from agent.metrics import GREATER_IS_BETTER, POSITIVE_NAMES, better, to_labels  # noqa: E402
+from agent.metrics import GREATER_IS_BETTER, NONNEG_METRICS, POSITIVE_NAMES, better, to_labels  # noqa: E402
+from agent.llm import LLM  # noqa: E402
 from agent.postproc import class_weights  # noqa: E402
-from agent.spec import TaskSpec, parse  # noqa: E402
+from agent.research import ask_metric, research_loop  # noqa: E402
+from agent.spec import KIND_OF_METRIC, PROBA_METRICS, TaskSpec, find_metric, parse  # noqa: E402
 from agent.taskio import check_submission, locate, write_atomic  # noqa: E402
 from agent.text import find_text_columns, text_features  # noqa: E402
 
@@ -35,6 +37,8 @@ MIN_REL_GAIN = 0.002
 # Новые модели зоопарка не запускаем позже этого срока от старта. Лимит платформы 3 ч,
 # запас на случай, если её CPU медленнее нашего стенда.
 ZOO_DEADLINE_S = 100 * 60
+# Цикл гипотез LLM не дольше этого срока от старта: дальше время нужно зоопарку.
+RESEARCH_DEADLINE_S = 45 * 60
 # Потолок на одну модель: CatBoost на 10 классах шёл 28 минут и смесь не улучшил.
 MODEL_MAX_S = 15 * 60
 # CatBoost MultiClass на 10 классах и 87 тыс. строк шёл 15 минут на фолд: потолок срабатывает
@@ -72,7 +76,7 @@ def constant_submission(train: pd.DataFrame, test: pd.DataFrame, sample: pd.Data
 def to_submission(pred: np.ndarray, test: pd.DataFrame, spec: TaskSpec,
                   weights: np.ndarray | None = None) -> pd.DataFrame:
     if spec.kind == "regression":
-        values = pred
+        values = np.maximum(pred, 0) if spec.metric in NONNEG_METRICS else pred
     elif spec.proba_output:
         named = [i for i, c in enumerate(spec.classes) if str(c).strip().lower() in POSITIVE_NAMES]
         values = pred[:, named[0] if named else 1]
@@ -159,6 +163,15 @@ def main(task_path: Path) -> None:
     try:
         spec = parse(files.task_text, train.dropna(subset=[target]), sample)
         train = train.dropna(subset=[target]).reset_index(drop=True)
+        llm = LLM()
+        if find_metric(files.task_text) is None and llm.enabled:
+            allowed = [m for m in GREATER_IS_BETTER
+                       if (KIND_OF_METRIC.get(m) == "regression") == (spec.kind == "regression")]
+            metric = ask_metric(llm, files.task_text, spec.kind, allowed)
+            if metric:
+                spec.metric = metric
+                spec.proba_output = (spec.kind == "binary" and metric in PROBA_METRICS
+                                     and pd.api.types.is_numeric_dtype(sample[target]))
         log.info("spec: %s", spec)
         if spec.proba_output:
             classes = None
@@ -184,24 +197,26 @@ def main(task_path: Path) -> None:
         if save(to_submission(result.test_pred, test, spec, weights), test, sample, classes, files.submission):
             log.info("Сабмит (%s) записан за %.1f с", what, time.monotonic() - started)
 
-    def attempt(what: str, make) -> None:
-        """Пробуем шаг. Выиграл по фолдам — он становится текущим и пишет сабмит."""
+    def attempt(what: str, make) -> tuple[bool, float | None]:
+        """Пробуем шаг. Выиграл по фолдам — он становится текущим и пишет сабмит.
+        Возвращает (принят ли, скор кандидата)."""
         try:
             new = make()
         except OutOfTime as error:
             log.info("%s: пропущено, %s", what, error)
-            return
+            return False, None
         except Exception:
             log.exception("%s упало, остаётся прошлый сабмит", what)
-            return
+            return False, None
         if new is None:
-            return
+            return False, None
         if wins(spec.metric, new.result, state.result):
             log.info("%s: принято, %s %.5f против %.5f", what, spec.metric, new.result.score, state.result.score)
             state.__dict__.update(new.__dict__)
             submit(state.result, what)
-        else:
-            log.info("%s: отклонено, %s %.5f против %.5f", what, spec.metric, new.result.score, state.result.score)
+            return True, new.result.score
+        log.info("%s: отклонено, %s %.5f против %.5f", what, spec.metric, new.result.score, state.result.score)
+        return False, new.result.score
 
     if folds.period_col is not None and spec.kind == "regression":
         key = None
@@ -219,6 +234,23 @@ def main(task_path: Path) -> None:
                 tr, te, _ = add_lags(state.train, state.test, key, folds.period_col, spec.target, features)
                 return Stage(tr, te, run_core(tr, te, spec, folds, name="lags"), None)
             attempt("lags", lags)
+
+    # AutoResearch: LLM предлагает гипотезы по смыслу колонок и по ошибкам модели,
+    # проверяем быстрым LightGBM на тех же фолдах. Без ключа LLM цикл не запускается.
+    if llm.enabled:
+        # Дедлайн с запасом: начатую оценку гипотезы на большой таблице не бросаем на середине,
+        # но и затянуть её на время зоопарка не даём.
+        research_deadline = started + RESEARCH_DEADLINE_S
+
+        def evaluate_stage(what: str, tr: pd.DataFrame, te: pd.DataFrame):
+            return attempt(what, lambda: Stage(tr, te, run_core(tr, te, spec, folds, name=what,
+                                                               deadline=research_deadline + 10 * 60), None))
+        try:
+            dictionary = pd.read_csv(files.data_dictionary) if files.data_dictionary else None
+            research_loop(llm, state, spec, folds, files.task_text, dictionary, evaluate_stage,
+                          research_deadline, files.task_dir / "agent_journal.jsonl")
+        except Exception:
+            log.exception("research упал, идём дальше с тем, что есть")
 
     # Зоопарк: те же признаки и фолды, разные модели. Для неотрицательного таргета регрессии
     # каждая модель ещё и на log1p(y): выбирать по OOF, логарифмировать ли, ненадёжно

@@ -28,6 +28,7 @@ CAT_MAX_ROUNDS = 3000
 TRANSFORMS = {"log1p": (np.log1p, np.expm1)}
 DATE_SAMPLE, DATE_SHARE = 500, 0.95
 MAX_CAT_LEVELS, MAX_CAT_SHARE = 1000, 0.5
+L1_METRICS = ("mae", "medae", "smape")
 # На всём train данных больше, чем в любом фолде, поэтому раундов при рефите больше среднего.
 REFIT_MULT = 1.1
 MIN_FIT_ROWS, MIN_STOP_ROWS = 200, 50
@@ -121,7 +122,10 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) -> tup
 
 def lgb_objective(spec: TaskSpec) -> dict:
     if spec.kind == "regression":
-        return {"objective": "l1" if spec.metric == "mae" else "l2"}
+        # Для MAE-подобных метрик оптимум — медиана, для MAPE — взвешенная медиана.
+        if spec.metric == "mape":
+            return {"objective": "mape"}
+        return {"objective": "l1" if spec.metric in L1_METRICS else "l2"}
     if spec.kind == "binary":
         return {"objective": "binary"}
     return {"objective": "multiclass", "num_class": len(spec.classes)}
@@ -171,7 +175,8 @@ def _fit_lgb(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
 
 def _fit_cat(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
     from catboost import CatBoostClassifier, CatBoostRegressor
-    loss = {"regression": "MAE" if spec.metric == "mae" else "RMSE", "binary": "Logloss",
+    loss = {"regression": "MAPE" if spec.metric == "mape" else "MAE" if spec.metric in L1_METRICS else "RMSE",
+            "binary": "Logloss",
             "multiclass": "MultiClass"}[spec.kind]
     cls = CatBoostRegressor if spec.kind == "regression" else CatBoostClassifier
     base = dict(loss_function=loss, learning_rate=0.08, depth=6, thread_count=N_JOBS, random_seed=0,
@@ -191,7 +196,7 @@ def _fit_cat(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
 
 def _fit_xgb(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
     import xgboost as xgb
-    objective = {"regression": "reg:absoluteerror" if spec.metric == "mae" else "reg:squarederror",
+    objective = {"regression": "reg:absoluteerror" if spec.metric in L1_METRICS + ("mape",) else "reg:squarederror",
                  "binary": "binary:logistic", "multiclass": "multi:softprob"}[spec.kind]
     base = dict(objective=objective, learning_rate=0.05, max_depth=7, subsample=0.8, colsample_bytree=0.8,
                 min_child_weight=3, tree_method="hist", max_cat_to_onehot=1, nthread=N_JOBS, seed=0, **params)

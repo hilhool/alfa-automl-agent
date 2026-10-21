@@ -16,7 +16,7 @@ log = logging.getLogger("solution")
 
 GRID = np.array([0.33, 0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0])
 PASSES = 3
-TUNED_METRICS = ("f1_macro", "f1_weighted", "f1_binary")
+TUNED_METRICS = ("f1_macro", "f1_weighted", "f1_binary", "balanced_accuracy", "mcc", "kappa", "qwk")
 
 
 def fit_weights(y, proba: np.ndarray, classes: list, metric: str) -> np.ndarray:
