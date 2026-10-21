@@ -1,4 +1,5 @@
-"""Ядро без LLM: предобработка, LightGBM на зафиксированных фолдах, рефит на всём train.
+"""Ядро без LLM: предобработка, бустинг (LightGBM, CatBoost, XGBoost) на зафиксированных
+фолдах, рефит на всём train.
 
 Это нижняя ступень над константой. Всё остальное (признаки, цикл гипотез,
 тяжёлые модели) сравнивается с ним на тех же фолдах.
@@ -22,6 +23,8 @@ N_JOBS = 8
 LGB_PARAMS = dict(learning_rate=0.05, num_leaves=63, min_child_samples=20, feature_fraction=0.8,
                   bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, verbose=-1, num_threads=N_JOBS, seed=0)
 MAX_ROUNDS, EARLY_STOP = 5000, 100
+CAT_MAX_ROUNDS = 3000
+TRANSFORMS = {"log1p": (np.log1p, np.expm1)}
 DATE_SAMPLE, DATE_SHARE = 500, 0.95
 
 
@@ -74,7 +77,13 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) -> tup
         if pd.api.types.is_bool_dtype(x_tr[col]):
             x_tr[col], x_te[col] = x_tr[col].astype(int), x_te[col].astype(int)
         elif not pd.api.types.is_numeric_dtype(x_tr[col]):
-            cats = pd.Index(pd.concat([x_tr[col], x_te[col]]).dropna().astype(str).unique())
+            # Словарь только по train: значение, которого модель не видела, честнее отдать
+            # как пропуск. XGBoost отправлял невиданный State_11 в случайную ветку (RMSE 64 вместо 41).
+            cats = pd.Index(x_tr[col].dropna().astype(str).unique())
+            unseen = x_te[col].notna() & ~x_te[col].astype(str).isin(cats)
+            if unseen.any():
+                log.info("prepare: %s — %d строк test с невиданными значениями, считаем пропуском",
+                         col, int(unseen.sum()))
             x_tr[col] = pd.Categorical(x_tr[col].astype("string"), categories=cats)
             x_te[col] = pd.Categorical(x_te[col].astype("string"), categories=cats)
     return x_tr, x_te
@@ -95,42 +104,141 @@ def encode_target(y: pd.Series, spec: TaskSpec) -> np.ndarray:
     return y.astype(str).map(index).to_numpy()
 
 
-def predict(model: lgb.Booster, x: pd.DataFrame, spec: TaskSpec) -> np.ndarray:
-    raw = model.predict(x, num_threads=N_JOBS)
-    if spec.kind == "binary":
-        return np.column_stack([1 - raw, raw])
-    return raw
+class OutOfTime(Exception):
+    """Модель не успевает до дедлайна: бросаем её, сабмит остаётся прежним."""
+
+
+def _cat_frame(x: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """CatBoost хочет категории строками без NaN."""
+    x = x.copy()
+    cats = [c for c in x.columns if isinstance(x[c].dtype, pd.CategoricalDtype)]
+    for c in cats:
+        x[c] = x[c].astype("string").fillna("__nan__").astype(str)
+    return x, cats
+
+
+def _to_proba(raw: np.ndarray, seen: np.ndarray, spec: TaskSpec) -> np.ndarray:
+    """Столбцы вероятностей в порядке spec.classes, даже если в fit был не каждый класс."""
+    out = np.zeros((raw.shape[0], max(len(spec.classes), 2)))
+    out[:, np.asarray(seen).astype(int)] = raw
+    return out
+
+
+def _fit_lgb(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
+    full = {**LGB_PARAMS, **lgb_objective(spec), **params}
+    if x_stop is not None:
+        model = lgb.train(full, lgb.Dataset(x_fit, y_fit), MAX_ROUNDS, valid_sets=[lgb.Dataset(x_stop, y_stop)],
+                          callbacks=[lgb.early_stopping(EARLY_STOP, verbose=False)])
+        rounds = model.best_iteration or MAX_ROUNDS
+    else:
+        model = lgb.train(full, lgb.Dataset(x_fit, y_fit), rounds)
+    preds = []
+    for x in to_predict:
+        raw = model.predict(x, num_threads=N_JOBS)
+        preds.append(np.column_stack([1 - raw, raw]) if spec.kind == "binary" else raw)
+    return preds, rounds
+
+
+def _fit_cat(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
+    from catboost import CatBoostClassifier, CatBoostRegressor
+    loss = {"regression": "MAE" if spec.metric == "mae" else "RMSE", "binary": "Logloss",
+            "multiclass": "MultiClass"}[spec.kind]
+    cls = CatBoostRegressor if spec.kind == "regression" else CatBoostClassifier
+    base = dict(loss_function=loss, learning_rate=0.08, depth=6, thread_count=N_JOBS, random_seed=0,
+                verbose=False, allow_writing_files=False, **params)
+    x_fit, cats = _cat_frame(x_fit)
+    if x_stop is not None:
+        model = cls(iterations=CAT_MAX_ROUNDS, od_type="Iter", od_wait=EARLY_STOP, **base)
+        model.fit(x_fit, y_fit, cat_features=cats, eval_set=(_cat_frame(x_stop)[0], y_stop), use_best_model=True)
+        rounds = max(1, model.get_best_iteration() or CAT_MAX_ROUNDS)
+    else:
+        model = cls(iterations=rounds, **base)
+        model.fit(x_fit, y_fit, cat_features=cats)
+    if spec.kind == "regression":
+        return [model.predict(_cat_frame(x)[0]) for x in to_predict], rounds
+    return [_to_proba(model.predict_proba(_cat_frame(x)[0]), model.classes_, spec) for x in to_predict], rounds
+
+
+def _fit_xgb(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
+    import xgboost as xgb
+    objective = {"regression": "reg:absoluteerror" if spec.metric == "mae" else "reg:squarederror",
+                 "binary": "binary:logistic", "multiclass": "multi:softprob"}[spec.kind]
+    base = dict(objective=objective, learning_rate=0.05, max_depth=7, subsample=0.8, colsample_bytree=0.8,
+                min_child_weight=3, tree_method="hist", max_cat_to_onehot=1, nthread=N_JOBS, seed=0, **params)
+    seen = None
+    if spec.kind != "regression":
+        # XGBoost требует метки 0..m-1, поэтому перекодируем классы, которые есть в fit.
+        seen = np.unique(y_fit)
+        remap = np.full(int(seen.max()) + 1, -1)
+        remap[seen] = np.arange(len(seen))
+        y_fit = remap[y_fit]
+        if spec.kind == "multiclass":
+            base["num_class"] = len(seen)
+    d_fit = xgb.DMatrix(x_fit, y_fit, enable_categorical=True)
+    if x_stop is not None:
+        if seen is not None:
+            keep = np.isin(y_stop, seen)
+            x_stop, y_stop = x_stop[keep], remap[y_stop[keep]]
+        model = xgb.train(base, d_fit, MAX_ROUNDS, evals=[(xgb.DMatrix(x_stop, y_stop, enable_categorical=True), "s")],
+                          early_stopping_rounds=EARLY_STOP, verbose_eval=False)
+        rounds = model.best_iteration + 1
+    else:
+        model = xgb.train(base, d_fit, rounds)
+    preds = []
+    for x in to_predict:
+        raw = model.predict(xgb.DMatrix(x, enable_categorical=True), iteration_range=(0, rounds))
+        if spec.kind == "binary":
+            preds.append(_to_proba(np.column_stack([1 - raw, raw]), seen, spec))
+        elif spec.kind == "multiclass":
+            preds.append(_to_proba(raw, seen, spec))
+        else:
+            preds.append(raw)
+    return preds, rounds
+
+
+FITTERS = {"lgb": _fit_lgb, "cat": _fit_cat, "xgb": _fit_xgb}
 
 
 def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Folds,
-             params_override: dict | None = None) -> CoreResult:
+             params_override: dict | None = None, family: str = "lgb", transform: str | None = None,
+             deadline: float | None = None, name: str = "core") -> CoreResult:
+    """OOF на фолдах и предсказание test. transform="log1p" учит модель на log1p(y),
+    но OOF и метрика всегда в исходной шкале. deadline — момент time.monotonic(), после
+    которого модель не доучиваем: по первым фолдам видно, успеет ли она вместе с рефитом."""
     features = feature_columns(train, spec)
     x, x_test = prepare(train, test, features)
     y = encode_target(train[spec.target], spec)
-    params = {**LGB_PARAMS, **lgb_objective(spec), **(params_override or {})}
+    forward, back = TRANSFORMS.get(transform, (None, None))
+    y_model = forward(y) if forward else y
+    fitter, params = FITTERS[family], params_override or {}
 
     n, k = len(train), len(spec.classes)
-    oof = np.zeros(n) if spec.kind == "regression" else np.zeros((n, k))
+    oof = np.zeros(n) if spec.kind == "regression" else np.zeros((n, max(k, 2)))
     mask = np.zeros(n, dtype=bool)
     fold_scores, rounds = [], []
+    started = time.monotonic()
     for i, (tr, va) in enumerate(folds.splits):
+        if deadline is not None and i > 0:
+            per_fold = (time.monotonic() - started) / i
+            # Рефит на всём train стоит примерно как два фолда.
+            if time.monotonic() + per_fold * (len(folds.splits) - i + 2) > deadline:
+                raise OutOfTime(f"{name}: не успеваем, {per_fold:.0f} с на фолд")
         t0 = time.monotonic()
         fit, stop = inner_split(folds, tr)
-        model = lgb.train(params, lgb.Dataset(x.iloc[fit], y[fit]), MAX_ROUNDS,
-                          valid_sets=[lgb.Dataset(x.iloc[stop], y[stop])],
-                          callbacks=[lgb.early_stopping(EARLY_STOP, verbose=False)])
-        oof[va] = predict(model, x.iloc[va], spec)
+        (pred,), r = fitter(params, spec, x.iloc[fit], y_model[fit], x.iloc[stop], y_model[stop], [x.iloc[va]], None)
+        oof[va] = back(pred) if back else pred
         mask[va] = True
         fold_scores.append(evaluate(spec.metric, train[spec.target].iloc[va], oof[va], spec.classes))
-        rounds.append(model.best_iteration or MAX_ROUNDS)
-        log.info("core fold %d: %s=%.5f, rounds=%d, %.0f с", i, spec.metric, fold_scores[-1], rounds[-1],
+        rounds.append(r)
+        log.info("%s fold %d: %s=%.5f, rounds=%d, %.0f с", name, i, spec.metric, fold_scores[-1], r,
                  time.monotonic() - t0)
 
     score = evaluate(spec.metric, train[spec.target][mask], oof[mask], spec.classes)
     # На всём train данных больше, чем в любом фолде, поэтому раундов берём чуть больше среднего.
     full_rounds = max(50, int(np.mean(rounds) * 1.1))
-    model = lgb.train(params, lgb.Dataset(x, y), full_rounds)
-    test_pred = predict(model, x_test, spec)
-    log.info("core: %s OOF=%.5f по фолдам %s, рефит %d раундов", spec.metric, score,
-             [round(s, 5) for s in fold_scores], full_rounds)
+    (test_pred,), _ = fitter(params, spec, x, y_model, None, None, [x_test], full_rounds)
+    if back:
+        test_pred = back(test_pred)
+    log.info("%s: %s OOF=%.5f по фолдам %s, рефит %d раундов, %.0f с", name, spec.metric, score,
+             [round(s, 5) for s in fold_scores], full_rounds, time.monotonic() - started)
     return CoreResult(oof, mask, test_pred, score, fold_scores, full_rounds)

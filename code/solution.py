@@ -2,13 +2,14 @@
 
 Цепочка fallback: сначала на диск ложится константа (среднее или мода),
 потом поверх неё ядро без LLM: разбор задачи правилами, схема CV, LightGBM.
-Каждый следующий шаг (история сущностей, веса классов) принимается, только если
+Каждый следующий шаг (история сущностей, лаги, log-таргет, ансамбль, веса классов) принимается, только если
 выиграл на тех же фолдах, и сразу перезаписывает сабмит. Упал шаг — остаётся прошлый файл.
 """
 
 import logging
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -17,10 +18,11 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent.adversarial import adversarial  # noqa: E402
-from agent.core import CoreResult, run_core  # noqa: E402
+from agent.core import CoreResult, OutOfTime, run_core  # noqa: E402
 from agent.cv import Folds, make_folds  # noqa: E402
-from agent.entity import add_history, find_key  # noqa: E402
-from agent.metrics import better, to_labels  # noqa: E402
+from agent.ensemble import caruana, median_blend  # noqa: E402
+from agent.entity import add_history, add_lags, find_key  # noqa: E402
+from agent.metrics import GREATER_IS_BETTER, better, to_labels  # noqa: E402
 from agent.postproc import class_weights  # noqa: E402
 from agent.spec import TaskSpec, parse  # noqa: E402
 from agent.taskio import check_submission, locate, write_atomic  # noqa: E402
@@ -29,6 +31,31 @@ from agent.text import find_text_columns, text_features  # noqa: E402
 log = logging.getLogger("solution")
 
 MIN_FOLD_WIN_SHARE = 0.7
+MIN_REL_GAIN = 0.002
+# Новые модели зоопарка не запускаем позже этого срока от старта. Лимит платформы 3 ч,
+# запас на случай, если её CPU медленнее нашего стенда.
+ZOO_DEADLINE_S = 100 * 60
+# Потолок на одну модель: CatBoost на 10 классах шёл 28 минут и смесь не улучшил.
+MODEL_MAX_S = 15 * 60
+# CatBoost MultiClass на 10 классах и 87 тыс. строк шёл 15 минут на фолд: потолок срабатывает
+# только после первого фолда, поэтому при многих классах его не запускаем вовсе.
+MAX_CAT_CLASSES = 5
+ZOO = [
+    ("lgb_slow", "lgb", dict(learning_rate=0.03, num_leaves=15, min_child_samples=50, feature_fraction=0.6)),
+    ("cat", "cat", {}),
+    ("xgb", "xgb", {}),
+    ("lgb_deep", "lgb", dict(learning_rate=0.03, num_leaves=255, min_child_samples=10, lambda_l2=5.0,
+                              feature_fraction=0.5)),
+]
+
+
+@dataclass
+class Stage:
+    """Текущее лучшее: признаки, результат на фолдах и преобразование таргета."""
+    train: pd.DataFrame
+    test: pd.DataFrame
+    result: CoreResult
+    transform: str | None
 
 
 def constant_submission(train: pd.DataFrame, test: pd.DataFrame, sample: pd.DataFrame) -> pd.DataFrame:
@@ -61,10 +88,14 @@ def save(sub: pd.DataFrame, test: pd.DataFrame, sample: pd.DataFrame, classes: s
 
 
 def wins(metric: str, new: CoreResult, old: CoreResult) -> bool:
-    """Новый вариант лучше в среднем и не хуже минимум на 70% фолдов. Ничья не проигрыш:
-    у признаков по прошлому на самом раннем периоде пусто, и там фолд совпадает до знака."""
+    """Новый вариант лучше в среднем хотя бы на MIN_REL_GAIN и не хуже минимум на 70% фолдов.
+    Ничья не проигрыш: у признаков по прошлому на самом раннем периоде пусто, и там фолд
+    совпадает до знака. Порог нужен против шума: лаги дали +0,05% по OOF и −2,5 RMSE на holdout."""
     worse = [better(metric, b, a) for a, b in zip(new.fold_scores, old.fold_scores)]
-    return better(metric, new.score, old.score) and 1 - np.mean(worse) >= MIN_FOLD_WIN_SHARE
+    margin = MIN_REL_GAIN * abs(old.score)
+    # Штрафуем новый вариант на margin: он должен выиграть с запасом.
+    shifted = new.score - margin if GREATER_IS_BETTER[metric] else new.score + margin
+    return better(metric, shifted, old.score) and 1 - np.mean(worse) >= MIN_FOLD_WIN_SHARE
 
 
 def fold_index(folds: Folds, n: int) -> np.ndarray:
@@ -135,29 +166,91 @@ def main(task_path: Path) -> None:
     except Exception:
         log.exception("adversarial validation упала, идём дальше")
 
+    state = Stage(train, test, best, None)
+
+    def submit(result: CoreResult, what: str, weights: np.ndarray | None = None) -> None:
+        if save(to_submission(result.test_pred, test, spec, weights), test, sample, classes, files.submission):
+            log.info("Сабмит (%s) записан за %.1f с", what, time.monotonic() - started)
+
+    def attempt(what: str, make) -> None:
+        """Пробуем шаг. Выиграл по фолдам — он становится текущим и пишет сабмит."""
+        try:
+            new = make()
+        except OutOfTime as error:
+            log.info("%s: пропущено, %s", what, error)
+            return
+        except Exception:
+            log.exception("%s упало, остаётся прошлый сабмит", what)
+            return
+        if new is None:
+            return
+        if wins(spec.metric, new.result, state.result):
+            log.info("%s: принято, %s %.5f против %.5f", what, spec.metric, new.result.score, state.result.score)
+            state.__dict__.update(new.__dict__)
+            submit(state.result, what)
+        else:
+            log.info("%s: отклонено, %s %.5f против %.5f", what, spec.metric, new.result.score, state.result.score)
+
     if folds.period_col is not None and spec.kind == "regression":
+        key = None
         try:
             key = find_key(train, test, features, folds.period_col, spec.target)
-            if key is not None:
-                tr_e, te_e, _ = add_history(train, test, key, folds.period_col, spec.target)
-                candidate = run_core(tr_e, te_e, spec, folds)
-                if wins(spec.metric, candidate, best):
-                    best = candidate
-                    log.info("entity: принято, %s %.5f", spec.metric, best.score)
-                    if save(to_submission(best.test_pred, test, spec), test, sample, classes, files.submission):
-                        log.info("Сабмит с историей сущностей записан за %.1f с", time.monotonic() - started)
-                else:
-                    log.info("entity: отклонено, %s %.5f против %.5f", spec.metric, candidate.score, best.score)
         except Exception:
-            log.exception("История сущностей упала, остаётся прошлый сабмит")
+            log.exception("Поиск ключа сущности упал")
+        if key is not None:
+            def history() -> Stage:
+                tr, te, _ = add_history(train, test, key, folds.period_col, spec.target)
+                return Stage(tr, te, run_core(tr, te, spec, folds, name="entity"), None)
+            attempt("entity", history)
+
+            def lags() -> Stage:
+                tr, te, _ = add_lags(state.train, state.test, key, folds.period_col, spec.target, features)
+                return Stage(tr, te, run_core(tr, te, spec, folds, name="lags"), None)
+            attempt("lags", lags)
+
+    # Зоопарк: те же признаки и фолды, разные модели. Для неотрицательного таргета регрессии
+    # каждая модель ещё и на log1p(y): выбирать по OOF, логарифмировать ли, ненадёжно
+    # (на reg_holdout OOF почти равны, а test 38,9 против 41,2), медиана решит без выбора.
+    candidates = {"lgb": state.result}
+    transforms = [None]
+    if spec.kind == "regression" and train[spec.target].min() >= 0:
+        transforms.append("log1p")
+    deadline = started + ZOO_DEADLINE_S
+    plan = [(f"{name}+{t}" if t else name, family, params, t) for t in transforms
+            for name, family, params in [("lgb", "lgb", {})] + ZOO]
+    for name, family, params, transform in plan:
+        if name == "lgb":
+            continue
+        if family == "cat" and spec.kind == "multiclass" and len(spec.classes) > MAX_CAT_CLASSES:
+            log.info("zoo: %s пропускаем, %d классов", name, len(spec.classes))
+            continue
+        if time.monotonic() > deadline:
+            log.info("zoo: время вышло, %s и дальше не запускаем", name)
+            break
+        try:
+            candidates[name] = run_core(state.train, state.test, spec, folds, params, family, transform,
+                                        min(deadline, time.monotonic() + MODEL_MAX_S), name)
+        except OutOfTime as error:
+            log.info("zoo: %s", error)
+        except Exception:
+            log.exception("zoo: %s упала", name)
+
+    def blend() -> Stage | None:
+        y = state.train[spec.target]
+        if spec.kind == "regression":
+            mixed = median_blend(candidates, y, spec.metric, folds)
+        else:
+            mixed = caruana(candidates, y, spec.metric, spec.classes, folds)
+            mixed = mixed and mixed[0]
+        return None if mixed is None else Stage(state.train, state.test, mixed, None)
+    attempt("ensemble", blend)
 
     if spec.kind != "regression" and not spec.proba_output:
         try:
-            weights = class_weights(train[spec.target], best.oof, best.oof_mask,
+            weights = class_weights(train[spec.target], state.result.oof, state.result.oof_mask,
                                     fold_index(folds, len(train)), spec.classes, spec.metric)
-            if weights is not None and save(to_submission(best.test_pred, test, spec, weights), test, sample,
-                                            classes, files.submission):
-                log.info("Сабмит с весами классов записан за %.1f с", time.monotonic() - started)
+            if weights is not None:
+                submit(state.result, "веса классов", weights)
         except Exception:
             log.exception("Подстройка весов классов упала, остаётся прошлый сабмит")
     log.info("Готово за %.1f с", time.monotonic() - started)
