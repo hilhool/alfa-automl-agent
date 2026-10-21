@@ -144,6 +144,8 @@ def add_lags(train: pd.DataFrame, test: pd.DataFrame, key: EntityKey, period: st
              features: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Таргет сущности ровно 1, 2, 3 периода назад и прошлое значение / изменение
     меняющихся колонок. Берём только из train: test — всегда последний период."""
+    if not (test[period].dropna() == train[period].max() + 1).all():
+        raise ValueError("test не следующий период после train: точные лаги в test будут пустыми")
     cols = changing_columns(train, key, period, target, features)
     table = train[cols + [target]].copy()
     table["k"], table["p"] = _key(train, key.cols).to_numpy(), train[period].to_numpy()

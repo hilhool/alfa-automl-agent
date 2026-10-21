@@ -6,6 +6,7 @@
 """
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 
@@ -14,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from agent.cv import Folds, inner_split
-from agent.metrics import evaluate
+from agent.metrics import evaluate, safe_evaluate
 from agent.spec import TaskSpec
 
 log = logging.getLogger("solution")
@@ -26,6 +27,7 @@ MAX_ROUNDS, EARLY_STOP = 5000, 100
 CAT_MAX_ROUNDS = 3000
 TRANSFORMS = {"log1p": (np.log1p, np.expm1)}
 DATE_SAMPLE, DATE_SHARE = 500, 0.95
+MAX_CAT_LEVELS, MAX_CAT_SHARE = 1000, 0.5
 
 
 @dataclass
@@ -38,8 +40,22 @@ class CoreResult:
     rounds: int
 
 
-def feature_columns(train: pd.DataFrame, spec: TaskSpec) -> list[str]:
-    return [c for c in train.columns if c not in (spec.id_col, spec.target) and train[c].nunique(dropna=False) > 1]
+def feature_columns(train: pd.DataFrame, spec: TaskSpec, test: pd.DataFrame | None = None) -> list[str]:
+    """Колонки, которые есть и в test (колонка только в train — утечка или служебная)."""
+    return [c for c in train.columns if c not in (spec.id_col, spec.target) and train[c].nunique(dropna=False) > 1
+            and (test is None or c in test.columns)]
+
+
+def safe_names(columns) -> list[str]:
+    """LightGBM не принимает в именах JSON-символы, XGBoost — [ ] <."""
+    out, seen = [], set()
+    for i, c in enumerate(columns):
+        name = re.sub(r"[^0-9A-Za-zА-Яа-яЁё_]", "_", str(c)) or f"f{i}"
+        while name in seen:
+            name += f"_{i}"
+        seen.add(name)
+        out.append(name)
+    return out
 
 
 def parse_dates(s: pd.Series) -> pd.Series | None:
@@ -73,7 +89,17 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) -> tup
     """Даты в части, строковые колонки в category с общим словарём train+test, bool в int.
     Пропуски LightGBM разберёт сам."""
     x_tr, x_te = expand_dates(train[features].copy(), test[features].copy())
-    for col in x_tr.columns:
+    for col in list(x_tr.columns):
+        if pd.api.types.is_numeric_dtype(x_tr[col]) and not pd.api.types.is_numeric_dtype(x_te[col]):
+            x_te[col] = pd.to_numeric(x_te[col], errors="coerce")
+        if (not pd.api.types.is_numeric_dtype(x_tr[col]) and not pd.api.types.is_bool_dtype(x_tr[col])
+                and x_tr[col].nunique() > max(MAX_CAT_LEVELS, MAX_CAT_SHARE * len(x_tr))):
+            # Почти уникальная строка (id, хеш) как category тормозит бустинг и переобучает его.
+            freq = x_tr[col].astype(str).value_counts(normalize=True)
+            x_tr[col] = x_tr[col].astype(str).map(freq).astype(float)
+            x_te[col] = x_te[col].astype(str).map(freq).astype(float)
+            log.info("prepare: %s — %d уровней, заменили на частоту", col, len(freq))
+            continue
         if pd.api.types.is_bool_dtype(x_tr[col]):
             x_tr[col], x_te[col] = x_tr[col].astype(int), x_te[col].astype(int)
         elif not pd.api.types.is_numeric_dtype(x_tr[col]):
@@ -86,6 +112,7 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) -> tup
                          col, int(unseen.sum()))
             x_tr[col] = pd.Categorical(x_tr[col].astype("string"), categories=cats)
             x_te[col] = pd.Categorical(x_te[col].astype("string"), categories=cats)
+    x_tr.columns = x_te.columns = safe_names(x_tr.columns)
     return x_tr, x_te
 
 
@@ -205,7 +232,7 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
     """OOF на фолдах и предсказание test. transform="log1p" учит модель на log1p(y),
     но OOF и метрика всегда в исходной шкале. deadline — момент time.monotonic(), после
     которого модель не доучиваем: по первым фолдам видно, успеет ли она вместе с рефитом."""
-    features = feature_columns(train, spec)
+    features = feature_columns(train, spec, test)
     x, x_test = prepare(train, test, features)
     y = encode_target(train[spec.target], spec)
     forward, back = TRANSFORMS.get(transform, (None, None))
@@ -228,7 +255,7 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
         (pred,), r = fitter(params, spec, x.iloc[fit], y_model[fit], x.iloc[stop], y_model[stop], [x.iloc[va]], None)
         oof[va] = back(pred) if back else pred
         mask[va] = True
-        fold_scores.append(evaluate(spec.metric, train[spec.target].iloc[va], oof[va], spec.classes))
+        fold_scores.append(safe_evaluate(spec.metric, train[spec.target].iloc[va], oof[va], spec.classes))
         rounds.append(r)
         log.info("%s fold %d: %s=%.5f, rounds=%d, %.0f с", name, i, spec.metric, fold_scores[-1], r,
                  time.monotonic() - t0)

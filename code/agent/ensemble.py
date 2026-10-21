@@ -10,7 +10,7 @@ import logging
 import numpy as np
 
 from agent.core import CoreResult
-from agent.metrics import better, evaluate
+from agent.metrics import better, evaluate, safe_evaluate
 
 log = logging.getLogger("solution")
 
@@ -55,7 +55,7 @@ def caruana(candidates: dict[str, CoreResult], y, metric: str, classes: list,
     oof = sum(candidates[n].oof * c for n, c in counts.items()) / total
     test_pred = sum(candidates[n].test_pred * c for n, c in counts.items()) / total
     y_all = np.asarray(y)
-    fold_scores = [evaluate(metric, y_all[va], oof[va], classes) for _, va in folds.splits]
+    fold_scores = [safe_evaluate(metric, y_all[va], oof[va], classes) for _, va in folds.splits]
     log.info("ensemble: веса %s, %s OOF %.5f", counts, metric, best)
     return CoreResult(oof, mask, test_pred, best, fold_scores, 0), counts
 
@@ -72,6 +72,6 @@ def median_blend(candidates: dict[str, CoreResult], y, metric: str, folds) -> Co
     test_pred = np.median(np.column_stack([r.test_pred for r in results]), axis=1)
     y = np.asarray(y)
     score = evaluate(metric, y[mask], oof[mask], [])
-    fold_scores = [evaluate(metric, y[va], oof[va], []) for _, va in folds.splits]
+    fold_scores = [safe_evaluate(metric, y[va], oof[va], []) for _, va in folds.splits]
     log.info("ensemble: медиана %d кандидатов %s, %s OOF %.5f", len(results), list(candidates), metric, score)
     return CoreResult(oof, mask, test_pred, score, fold_scores, 0)

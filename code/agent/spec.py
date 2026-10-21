@@ -51,18 +51,24 @@ def parse(task_text: str, train: pd.DataFrame, sample: pd.DataFrame) -> TaskSpec
     id_col, target = sample.columns[0], sample.columns[1]
     y = train[target].dropna()
     numeric = pd.api.types.is_numeric_dtype(y)
-    if numeric and (pd.api.types.is_float_dtype(y) and (y % 1 != 0).any() or y.nunique() > 50):
+    found = find_metric(task_text)
+    # Целочисленный таргет с малым числом значений (счётчик, рейтинг) — регрессия,
+    # если в task.md названа регрессионная метрика.
+    if numeric and (pd.api.types.is_float_dtype(y) and (y % 1 != 0).any() or y.nunique() > 50
+                    or KIND_OF_METRIC.get(found) == "regression"):
         kind = "regression"
     else:
         kind = "binary" if y.nunique() == 2 else "multiclass"
 
-    metric = find_metric(task_text) or DEFAULT_METRIC[kind]
+    metric = found or DEFAULT_METRIC[kind]
     if (KIND_OF_METRIC.get(metric) == "regression") != (kind == "regression"):
         metric = DEFAULT_METRIC[kind]
     if kind == "multiclass" and metric == "f1_binary":
         metric = "f1_macro"
 
     classes = [] if kind == "regression" else sorted(y.unique().tolist(), key=str)
-    # Вероятность пишем, только если метрика её требует и шаблон числовой.
-    proba = metric in ("roc_auc", "logloss") and pd.api.types.is_float_dtype(sample[target])
+    # Вероятность пишем для binary, если метрика её требует и шаблон числовой (0/0.0).
+    # Мультикласс с вероятностями в одну колонку не записать, там остаются метки.
+    proba = (kind == "binary" and metric in ("roc_auc", "logloss")
+             and pd.api.types.is_numeric_dtype(sample[target]))
     return TaskSpec(kind=kind, metric=metric, target=target, id_col=id_col, classes=classes, proba_output=proba)

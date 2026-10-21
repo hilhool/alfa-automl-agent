@@ -22,7 +22,7 @@ from agent.core import CoreResult, OutOfTime, run_core  # noqa: E402
 from agent.cv import Folds, make_folds  # noqa: E402
 from agent.ensemble import caruana, median_blend  # noqa: E402
 from agent.entity import add_history, add_lags, find_key  # noqa: E402
-from agent.metrics import GREATER_IS_BETTER, better, to_labels  # noqa: E402
+from agent.metrics import GREATER_IS_BETTER, POSITIVE_NAMES, better, to_labels  # noqa: E402
 from agent.postproc import class_weights  # noqa: E402
 from agent.spec import TaskSpec, parse  # noqa: E402
 from agent.taskio import check_submission, locate, write_atomic  # noqa: E402
@@ -72,7 +72,8 @@ def to_submission(pred: np.ndarray, test: pd.DataFrame, spec: TaskSpec,
     if spec.kind == "regression":
         values = pred
     elif spec.proba_output:
-        values = pred[:, 1]
+        named = [i for i, c in enumerate(spec.classes) if str(c).strip().lower() in POSITIVE_NAMES]
+        values = pred[:, named[0] if named else 1]
     else:
         values = to_labels(pred, spec.classes, weights)
     return pd.DataFrame({spec.id_col: test[spec.id_col].to_numpy(), spec.target: values})
@@ -91,7 +92,10 @@ def wins(metric: str, new: CoreResult, old: CoreResult) -> bool:
     """Новый вариант лучше в среднем хотя бы на MIN_REL_GAIN и не хуже минимум на 70% фолдов.
     Ничья не проигрыш: у признаков по прошлому на самом раннем периоде пусто, и там фолд
     совпадает до знака. Порог нужен против шума: лаги дали +0,05% по OOF и −2,5 RMSE на holdout."""
-    worse = [better(metric, b, a) for a, b in zip(new.fold_scores, old.fold_scores)]
+    pairs = [(a, b) for a, b in zip(new.fold_scores, old.fold_scores) if np.isfinite(a) and np.isfinite(b)]
+    if not pairs:
+        return False
+    worse = [better(metric, b, a) for a, b in pairs]
     margin = MIN_REL_GAIN * abs(old.score)
     # Штрафуем новый вариант на margin: он должен выиграть с запасом.
     shifted = new.score - margin if GREATER_IS_BETTER[metric] else new.score + margin
@@ -139,10 +143,16 @@ def main(task_path: Path) -> None:
     sample = pd.read_csv(files.sample_submission)
 
     target = sample.columns[1]
-    classes = None if pd.api.types.is_numeric_dtype(train[target]) else set(train[target].dropna().unique())
-    if not save(constant_submission(train, test, sample), test, sample, classes, files.submission):
-        raise RuntimeError("Даже константный сабмит не прошёл проверку")
-    log.info("Константа записана за %.1f с", time.monotonic() - started)
+    try:
+        classes = None if pd.api.types.is_numeric_dtype(train[target]) else set(train[target].dropna().unique())
+        if not save(constant_submission(train, test, sample), test, sample, classes, files.submission):
+            raise RuntimeError("константный сабмит не прошёл проверку")
+        log.info("Константа записана за %.1f с", time.monotonic() - started)
+    except Exception:
+        # Последний рубеж: таргет или id называются не как в sample. Шаблон лучше, чем ничего.
+        log.exception("Константа не вышла, пишем копию sample_submission")
+        write_atomic(sample, files.submission)
+        return
 
     try:
         spec = parse(files.task_text, train.dropna(subset=[target]), sample)
@@ -150,7 +160,7 @@ def main(task_path: Path) -> None:
         log.info("spec: %s", spec)
         if spec.proba_output:
             classes = None
-        features = [c for c in train.columns if c not in (spec.id_col, spec.target)]
+        features = [c for c in train.columns if c not in (spec.id_col, spec.target) and c in test.columns]
         folds = make_folds(train, test, features, train[spec.target], spec.kind)
         log.info("cv: %s, %d фолдов. %s", folds.scheme, len(folds.splits), folds.note)
         train, test, features = with_text(train, test, features, spec, folds, files.data_dictionary)
