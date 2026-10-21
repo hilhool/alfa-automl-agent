@@ -116,6 +116,12 @@ def main() -> None:
 
     reg = pd.read_csv(SOURCES["reg"] / "train.csv")
     holdout("reg_holdout", "regression", reg, (reg["Year_Factor"] == 5).to_numpy(), SOURCES["reg"])
+    # reg_holdout завышает пользу от устойчивости к новому штату: State_11 там есть только в test,
+    # а в настоящем public он есть и в train. Эти два ближе к public.
+    h4 = reg[reg["Year_Factor"] <= 4].reset_index(drop=True)
+    holdout("reg_h4", "regression", h4, (h4["Year_Factor"] == 4).to_numpy(), SOURCES["reg"])
+    h5 = reg[~((reg["Year_Factor"] == 5) & (reg["State_Factor"] == "State_11"))].reset_index(drop=True)
+    holdout("reg_h5", "regression", h5, (h5["Year_Factor"] == 5).to_numpy(), SOURCES["reg"])
 
     cls = pd.read_csv(SOURCES["cls"] / "train.csv")
     _, test_idx = train_test_split(np.arange(len(cls)), test_size=0.3, stratify=cls["attack_cat"], random_state=0)

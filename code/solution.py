@@ -40,6 +40,8 @@ MODEL_MAX_S = 15 * 60
 # CatBoost MultiClass на 10 классах и 87 тыс. строк шёл 15 минут на фолд: потолок срабатывает
 # только после первого фолда, поэтому при многих классах его не запускаем вовсе.
 MAX_CAT_CLASSES = 5
+FORWARD_REFIT_MULT = 2.5
+LAST_PERIOD_REPEATS = 3
 ZOO = [
     ("lgb_slow", "lgb", dict(learning_rate=0.03, num_leaves=15, min_child_samples=50, feature_fraction=0.6)),
     ("cat", "cat", {}),
@@ -221,15 +223,26 @@ def main(task_path: Path) -> None:
     # Зоопарк: те же признаки и фолды, разные модели. Для неотрицательного таргета регрессии
     # каждая модель ещё и на log1p(y): выбирать по OOF, логарифмировать ли, ненадёжно
     # (на reg_holdout OOF почти равны, а test 38,9 против 41,2), медиана решит без выбора.
+    #
+    # При валидации вперёд по времени (проверено на двух holdout регрессии, H4 и H5):
+    # early stopping по одному следующему периоду останавливается рано, рефит ×2,5 раунда
+    # дал −0,9 RMSE; вес ×3 последнему периоду ещё −0,3; модель на остатке к прошлому
+    # значению сущности как второй вариант каждого кандидата — ещё −0,6 сверху.
     candidates = {"lgb": state.result}
     transforms = [None]
     if spec.kind == "regression" and train[spec.target].min() >= 0:
         transforms.append("log1p")
+    forward = folds.scheme == "time_forward"
+    extra = {}
+    if forward:
+        last = state.train[folds.period_col] == state.train[folds.period_col].max()
+        extra = dict(refit_mult=FORWARD_REFIT_MULT, repeats=np.where(last, LAST_PERIOD_REPEATS, 1))
+    residual = "ent_last" if spec.kind == "regression" and "ent_last" in state.train.columns else None
     deadline = started + ZOO_DEADLINE_S
     plan = [(f"{name}+{t}" if t else name, family, params, t) for t in transforms
             for name, family, params in [("lgb", "lgb", {})] + ZOO]
     for name, family, params, transform in plan:
-        if name == "lgb":
+        if name == "lgb" and not forward:
             continue
         if family == "cat" and spec.kind == "multiclass" and len(spec.classes) > MAX_CAT_CLASSES:
             log.info("zoo: %s пропускаем, %d классов", name, len(spec.classes))
@@ -239,7 +252,12 @@ def main(task_path: Path) -> None:
             break
         try:
             candidates[name] = run_core(state.train, state.test, spec, folds, params, family, transform,
-                                        min(deadline, time.monotonic() + MODEL_MAX_S), name)
+                                        min(deadline, time.monotonic() + MODEL_MAX_S), name, **extra)
+            if residual:
+                candidates[name + "+resid"] = run_core(
+                    state.train, state.test, spec, folds, params, family, transform,
+                    min(deadline, time.monotonic() + MODEL_MAX_S), name + "+resid", residual_of=residual,
+                    fallback=candidates[name], **extra)
         except OutOfTime as error:
             log.info("zoo: %s", error)
         except Exception:

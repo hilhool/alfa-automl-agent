@@ -28,6 +28,9 @@ CAT_MAX_ROUNDS = 3000
 TRANSFORMS = {"log1p": (np.log1p, np.expm1)}
 DATE_SAMPLE, DATE_SHARE = 500, 0.95
 MAX_CAT_LEVELS, MAX_CAT_SHARE = 1000, 0.5
+# На всём train данных больше, чем в любом фолде, поэтому раундов при рефите больше среднего.
+REFIT_MULT = 1.1
+MIN_FIT_ROWS, MIN_STOP_ROWS = 200, 50
 
 
 @dataclass
@@ -228,16 +231,40 @@ FITTERS = {"lgb": _fit_lgb, "cat": _fit_cat, "xgb": _fit_xgb}
 
 def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Folds,
              params_override: dict | None = None, family: str = "lgb", transform: str | None = None,
-             deadline: float | None = None, name: str = "core") -> CoreResult:
+             deadline: float | None = None, name: str = "core", refit_mult: float = REFIT_MULT,
+             repeats: np.ndarray | None = None, residual_of: str | None = None,
+             fallback: CoreResult | None = None) -> CoreResult:
     """OOF на фолдах и предсказание test. transform="log1p" учит модель на log1p(y),
     но OOF и метрика всегда в исходной шкале. deadline — момент time.monotonic(), после
-    которого модель не доучиваем: по первым фолдам видно, успеет ли она вместе с рефитом."""
+    которого модель не доучиваем: по первым фолдам видно, успеет ли она вместе с рефитом.
+
+    repeats — сколько раз повторить строку в обучении (вес). residual_of — колонка-база
+    (прошлое значение сущности): модель учится на остатке y − база только на строках, где база
+    есть, а строки без базы берут предсказания fallback."""
     features = feature_columns(train, spec, test)
     x, x_test = prepare(train, test, features)
     y = encode_target(train[spec.target], spec)
     forward, back = TRANSFORMS.get(transform, (None, None))
-    y_model = forward(y) if forward else y
+    to_model = forward or (lambda v: v)
+    from_model = back or (lambda v: v)
+    y_model = to_model(y)
+    base_tr = base_te = None
+    rows = np.ones(len(train), dtype=bool)
+    if residual_of is not None:
+        base_tr = train[residual_of].to_numpy(dtype=float)
+        base_te = test[residual_of].to_numpy(dtype=float)
+        rows = ~np.isnan(base_tr)
+        y_model = np.where(rows, y_model - to_model(np.nan_to_num(base_tr)), np.nan)
     fitter, params = FITTERS[family], params_override or {}
+
+    def expand(idx: np.ndarray) -> np.ndarray:
+        idx = idx[rows[idx]]
+        return idx if repeats is None else np.repeat(idx, repeats[idx])
+
+    def restore(pred: np.ndarray, base: np.ndarray | None) -> np.ndarray:
+        if base is None:
+            return from_model(pred)
+        return from_model(pred + to_model(np.nan_to_num(base)))
 
     n, k = len(train), len(spec.classes)
     oof = np.zeros(n) if spec.kind == "regression" else np.zeros((n, max(k, 2)))
@@ -252,20 +279,32 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
                 raise OutOfTime(f"{name}: не успеваем, {per_fold:.0f} с на фолд")
         t0 = time.monotonic()
         fit, stop = inner_split(folds, tr)
-        (pred,), r = fitter(params, spec, x.iloc[fit], y_model[fit], x.iloc[stop], y_model[stop], [x.iloc[va]], None)
-        oof[va] = back(pred) if back else pred
+        fit, stop = expand(fit), stop[rows[stop]]
+        # Остаток учится на подмножестве строк с базой: в раннем фолде их может почти не быть.
+        if residual_of is not None and (len(fit) < MIN_FIT_ROWS or len(stop) < MIN_STOP_ROWS):
+            oof[va] = fallback.oof[va]
+        else:
+            (pred,), r = fitter(params, spec, x.iloc[fit], y_model[fit], x.iloc[stop], y_model[stop],
+                                [x.iloc[va]], None)
+            oof[va] = restore(pred, None if base_tr is None else base_tr[va])
+            if fallback is not None:
+                no_base = ~rows[va]
+                oof[va[no_base]] = fallback.oof[va[no_base]]
+            rounds.append(r)
         mask[va] = True
         fold_scores.append(safe_evaluate(spec.metric, train[spec.target].iloc[va], oof[va], spec.classes))
-        rounds.append(r)
-        log.info("%s fold %d: %s=%.5f, rounds=%d, %.0f с", name, i, spec.metric, fold_scores[-1], r,
-                 time.monotonic() - t0)
+        log.info("%s fold %d: %s=%.5f, %.0f с", name, i, spec.metric, fold_scores[-1], time.monotonic() - t0)
 
+    if not rounds:
+        raise ValueError(f"{name}: ни один фолд не обучился")
     score = evaluate(spec.metric, train[spec.target][mask], oof[mask], spec.classes)
-    # На всём train данных больше, чем в любом фолде, поэтому раундов берём чуть больше среднего.
-    full_rounds = max(50, int(np.mean(rounds) * 1.1))
-    (test_pred,), _ = fitter(params, spec, x, y_model, None, None, [x_test], full_rounds)
-    if back:
-        test_pred = back(test_pred)
+    full_rounds = max(50, int(np.mean(rounds) * refit_mult))
+    (test_pred,), _ = fitter(params, spec, x.iloc[expand(np.arange(n))], y_model[expand(np.arange(n))],
+                             None, None, [x_test], full_rounds)
+    test_pred = restore(test_pred, base_te)
+    if fallback is not None and base_te is not None:
+        no_base = np.isnan(base_te)
+        test_pred[no_base] = fallback.test_pred[no_base]
     log.info("%s: %s OOF=%.5f по фолдам %s, рефит %d раундов, %.0f с", name, spec.metric, score,
              [round(s, 5) for s in fold_scores], full_rounds, time.monotonic() - started)
     return CoreResult(oof, mask, test_pred, score, fold_scores, full_rounds)
