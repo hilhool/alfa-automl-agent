@@ -22,6 +22,10 @@ MAX_KEY_COLS = 6
 MIN_TEST_COVERAGE = 0.2
 MAX_STD_RATIO = 0.5      # std таргета внутри ключа против общего
 MAX_CARDINALITY = 0.9    # колонка почти уникальна в каждой строке — это не свойство сущности
+LAGS = (1, 2, 3)
+N_CHANGING = 3
+MIN_CHANGE_ROWS = 100
+MIN_CHANGE_RATE, MAX_CHANGE_RATE = 0.01, 0.99
 
 
 @dataclass
@@ -108,3 +112,59 @@ def add_history(train: pd.DataFrame, test: pd.DataFrame, key: EntityKey, period:
     log.info("entity: история есть у %.1f%% train и %.1f%% test", 100 * f_tr["ent_count"].gt(0).mean(),
              100 * f_te["ent_count"].gt(0).mean())
     return train, test, names
+
+
+def changing_columns(train: pd.DataFrame, key: EntityKey, period: str, target: str,
+                     features: list[str]) -> list[str]:
+    """Числовые колонки, которые у сущности меняются между периодами, по силе связи с таргетом.
+    Их прошлое значение и изменение — то, чего бустинг сам из строки не увидит."""
+    k = _key(train, key.cols)
+    order = np.lexsort((train[period].to_numpy(), k.to_numpy()))
+    df = train.iloc[order]
+    same = (k.iloc[order].to_numpy()[1:] == k.iloc[order].to_numpy()[:-1])
+    scored = []
+    for col in features:
+        if col in key.cols or col == period or not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        v = df[col].to_numpy(dtype=float)
+        cur, prev = v[1:][same], v[:-1][same]
+        ok = ~np.isnan(cur) & ~np.isnan(prev)
+        if ok.sum() < MIN_CHANGE_ROWS:
+            continue
+        rate = float((cur[ok] != prev[ok]).mean())
+        if not MIN_CHANGE_RATE <= rate <= MAX_CHANGE_RATE:
+            continue
+        corr = abs(df[col].corr(df[target], method="spearman"))
+        if np.isfinite(corr):
+            scored.append((corr, col))
+    return [c for _, c in sorted(scored, reverse=True)[:N_CHANGING]]
+
+
+def add_lags(train: pd.DataFrame, test: pd.DataFrame, key: EntityKey, period: str, target: str,
+             features: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Таргет сущности ровно 1, 2, 3 периода назад и прошлое значение / изменение
+    меняющихся колонок. Берём только из train: test — всегда последний период."""
+    cols = changing_columns(train, key, period, target, features)
+    table = train[cols + [target]].copy()
+    table["k"], table["p"] = _key(train, key.cols).to_numpy(), train[period].to_numpy()
+    table = table.groupby(["k", "p"], as_index=False).mean()
+
+    def build(df: pd.DataFrame) -> pd.DataFrame:
+        rows = pd.DataFrame({"k": _key(df, key.cols).to_numpy(), "p": df[period].to_numpy()})
+        out = pd.DataFrame(index=np.arange(len(df)))
+        for lag in LAGS:
+            shifted = table[["k", "p", target] + (cols if lag == 1 else [])].copy()
+            shifted["p"] = shifted["p"] + lag
+            m = rows.merge(shifted, on=["k", "p"], how="left")
+            out[f"ent_lag{lag}"] = m[target].to_numpy()
+            if lag == 1:
+                for c in cols:
+                    out[f"{c}_prev"] = m[c].to_numpy()
+                    out[f"{c}_diff"] = df[c].to_numpy(dtype=float) - m[c].to_numpy()
+        return out
+
+    f_tr, f_te = build(train), build(test)
+    names = list(f_tr.columns)
+    log.info("entity: лаги %s, меняющиеся колонки %s", LAGS, cols)
+    return (pd.concat([train.reset_index(drop=True), f_tr], axis=1),
+            pd.concat([test.reset_index(drop=True), f_te], axis=1), names)

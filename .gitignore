@@ -1,8 +1,11 @@
-.venv/
+# Ключи
 .env
+**/.env
+
+# Данные кейса: репозиторий публичный, CSV берём со страницы кейса
+Регрессия/*.csv
+Многоклассовая классификация/*.csv
+!Регрессия/data_dictionary.csv
+!Многоклассовая классификация/data_dictionary.csv
+
 __pycache__/
-bench/tasks/
-bench/answers/
-bench/runs/
-dist/
-bench/results.csv

@@ -32,6 +32,7 @@ CHECKS = {
                                         "json_schema": {"name": "answer", "schema": SCHEMA}},
                     "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
     "guided_json": {"extra_body": {"guided_json": SCHEMA, "chat_template_kwargs": {"enable_thinking": False}}},
+    "effort_low": {"extra_body": {"reasoning_effort": "low"}},
     "tools": {"tools": TOOL, "messages": [{"role": "user", "content": "Посчитай 2+2 через run_python."}]},
 }
 
