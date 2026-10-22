@@ -47,19 +47,21 @@ class LLM:
     def enabled(self) -> bool:
         return self.client is not None and self.failures < MAX_FAILURES
 
-    def ask_json(self, system: str, user: str, schema: dict, name: str = "answer") -> dict | None:
+    def ask_json(self, system: str, user: str, schema: dict, name: str = "answer",
+                 fast: bool = False) -> dict | None:
         """Ответ модели как dict по схеме или None. Схему передаём и в response_format,
-        и проверяем сами: прокси может её проигнорировать."""
+        и проверяем сами: прокси может её проигнорировать. fast — без рассуждения, около 5 с:
+        для коротких проверок вроде критика."""
         if not self.enabled:
             return None
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        for attempt, reasoning in enumerate(REASONING_TRIES[:RETRIES]):
+        tries = REASONING_TRIES[-1:] * RETRIES if fast else REASONING_TRIES[:RETRIES]
+        for attempt, reasoning in enumerate(tries):
             started = time.monotonic()
             try:
                 response = self.client.chat.completions.create(
                     model=self.model, messages=messages, max_tokens=MAX_TOKENS, temperature=0.7,
-                    response_format={"type": "json_schema", "json_schema": {"name": name, "schema": schema}},
-                    extra_body={"reasoning": reasoning})
+                    response_format={"type": "json_schema", "json_schema": {"name": name, "schema": schema}},                    extra_body={"reasoning": reasoning})
                 self.calls += 1
                 if response.usage:
                     self.tokens += response.usage.total_tokens or 0

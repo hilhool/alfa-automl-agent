@@ -32,6 +32,8 @@ L1_METRICS = ("mae", "medae", "smape")
 # На всём train данных больше, чем в любом фолде, поэтому раундов при рефите больше среднего.
 REFIT_MULT = 1.1
 MIN_FIT_ROWS, MIN_STOP_ROWS = 200, 50
+# Имя параметра seed у каждой библиотеки: при рефите на нескольких seed его подменяем.
+SEED_KEY = {"lgb": "seed", "cat": "random_seed", "xgb": "seed"}
 
 
 @dataclass
@@ -179,8 +181,8 @@ def _fit_cat(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
             "binary": "Logloss",
             "multiclass": "MultiClass"}[spec.kind]
     cls = CatBoostRegressor if spec.kind == "regression" else CatBoostClassifier
-    base = dict(loss_function=loss, learning_rate=0.08, depth=6, thread_count=N_JOBS, random_seed=0,
-                verbose=False, allow_writing_files=False, **params)
+    base = {**dict(loss_function=loss, learning_rate=0.08, depth=6, thread_count=N_JOBS, random_seed=0,
+                   verbose=False, allow_writing_files=False), **params}
     x_fit, cats = _cat_frame(x_fit)
     if x_stop is not None:
         model = cls(iterations=CAT_MAX_ROUNDS, od_type="Iter", od_wait=EARLY_STOP, **base)
@@ -198,8 +200,8 @@ def _fit_xgb(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
     import xgboost as xgb
     objective = {"regression": "reg:absoluteerror" if spec.metric in L1_METRICS + ("mape",) else "reg:squarederror",
                  "binary": "binary:logistic", "multiclass": "multi:softprob"}[spec.kind]
-    base = dict(objective=objective, learning_rate=0.05, max_depth=7, subsample=0.8, colsample_bytree=0.8,
-                min_child_weight=3, tree_method="hist", max_cat_to_onehot=1, nthread=N_JOBS, seed=0, **params)
+    base = {**dict(objective=objective, learning_rate=0.05, max_depth=7, subsample=0.8, colsample_bytree=0.8,
+                   min_child_weight=3, tree_method="hist", max_cat_to_onehot=1, nthread=N_JOBS, seed=0), **params}
     seen = None
     if spec.kind != "regression":
         # XGBoost требует метки 0..m-1, поэтому перекодируем классы, которые есть в fit.
@@ -238,11 +240,12 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
              params_override: dict | None = None, family: str = "lgb", transform: str | None = None,
              deadline: float | None = None, name: str = "core", refit_mult: float = REFIT_MULT,
              repeats: np.ndarray | None = None, residual_of: str | None = None,
-             fallback: CoreResult | None = None) -> CoreResult:
+             fallback: CoreResult | None = None, seeds: int = 1) -> CoreResult:
     """OOF на фолдах и предсказание test. transform="log1p" учит модель на log1p(y),
     но OOF и метрика всегда в исходной шкале. deadline — момент time.monotonic(), после
     которого модель не доучиваем: по первым фолдам видно, успеет ли она вместе с рефитом.
 
+    seeds — на скольких seed делать рефит и усреднять test: дисперсия ниже, OOF не меняется.
     repeats — сколько раз повторить строку в обучении (вес). residual_of — колонка-база
     (прошлое значение сущности): модель учится на остатке y − база только на строках, где база
     есть, а строки без базы берут предсказания fallback."""
@@ -304,12 +307,17 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
         raise ValueError(f"{name}: ни один фолд не обучился")
     score = evaluate(spec.metric, train[spec.target][mask], oof[mask], spec.classes)
     full_rounds = max(50, int(np.mean(rounds) * refit_mult))
-    (test_pred,), _ = fitter(params, spec, x.iloc[expand(np.arange(n))], y_model[expand(np.arange(n))],
-                             None, None, [x_test], full_rounds)
-    test_pred = restore(test_pred, base_te)
+    refit = []
+    for seed in range(max(1, seeds)):
+        if seed > 0 and deadline is not None and time.monotonic() > deadline:
+            break
+        (pred,), _ = fitter({**params, SEED_KEY[family]: seed}, spec, x.iloc[expand(np.arange(n))],
+                            y_model[expand(np.arange(n))], None, None, [x_test], full_rounds)
+        refit.append(pred)
+    test_pred = restore(np.mean(refit, axis=0), base_te)
     if fallback is not None and base_te is not None:
         no_base = np.isnan(base_te)
         test_pred[no_base] = fallback.test_pred[no_base]
-    log.info("%s: %s OOF=%.5f по фолдам %s, рефит %d раундов, %.0f с", name, spec.metric, score,
-             [round(s, 5) for s in fold_scores], full_rounds, time.monotonic() - started)
+    log.info("%s: %s OOF=%.5f по фолдам %s, рефит %d раундов на %d seed, %.0f с", name, spec.metric, score,
+             [round(s, 5) for s in fold_scores], full_rounds, len(refit), time.monotonic() - started)
     return CoreResult(oof, mask, test_pred, score, fold_scores, full_rounds)

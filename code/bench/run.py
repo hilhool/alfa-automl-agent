@@ -38,10 +38,11 @@ from agent.taskio import check_submission, locate  # noqa: E402
 # и вызовы LLM падают с Connection error. На платформе своя сеть.
 PASS_ENV = ("PATH", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "HOME",
             "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL",
-            "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
+            "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+            "AGENT_DUMP_CANDIDATES")
 
 
-def load_env() -> dict:
+def load_env(llm: bool = True) -> dict:
     env = {k: os.environ[k] for k in PASS_ENV if k in os.environ}
     for dotenv in (CODE / ".env", CODE.parent / ".env"):
         if not dotenv.exists():
@@ -51,6 +52,8 @@ def load_env() -> dict:
                 key, value = line.split("=", 1)
                 if value.strip():
                     env.setdefault(key.strip(), value.strip().strip('"'))
+    if not llm:
+        env = {k: v for k, v in env.items() if not k.startswith("OPENAI_")}
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
@@ -62,7 +65,7 @@ def tree(proc: psutil.Process) -> list[psutil.Process]:
         return []
 
 
-def run(name: str, timeout: float, cpus: int, archive: Path) -> dict:
+def run(name: str, timeout: float, cpus: int, archive: Path, llm: bool = True) -> dict:
     run_dir = BENCH / "runs" / f"{name}_{datetime.now():%Y%m%d_%H%M%S}"
     shutil.copytree(BENCH / "tasks" / name, run_dir)
     # Как платформа: в каталог задачи попадают только корневые .py и requirements.txt.
@@ -77,7 +80,7 @@ def run(name: str, timeout: float, cpus: int, archive: Path) -> dict:
     peak_rss, status = 0, "ok"
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.Popen([sys.executable, "solution.py", "task.md"], cwd=run_dir,
-                                env=load_env(), stdout=log, stderr=subprocess.STDOUT)
+                                env=load_env(llm), stdout=log, stderr=subprocess.STDOUT)
         ps = psutil.Process(proc.pid)
         try:
             ps.cpu_affinity(list(range(min(cpus, psutil.cpu_count()))))
@@ -137,13 +140,14 @@ def main() -> None:
     parser.add_argument("tasks", nargs="+")
     parser.add_argument("--timeout", type=float, default=3 * 3600)
     parser.add_argument("--cpus", type=int, default=8)
+    parser.add_argument("--no-llm", action="store_true", help="без OPENAI_*: проверка пути без LLM")
     parser.add_argument("--zip", type=Path, help="готовый архив; по умолчанию собираем из code/")
     args = parser.parse_args()
     archive = args.zip.resolve() if args.zip else build(CODE / "dist" / "solution.zip")
 
     results_path = BENCH / "results.csv"
     for name in args.tasks:
-        result = run(name, args.timeout, args.cpus, archive)
+        result = run(name, args.timeout, args.cpus, archive, not args.no_llm)
         print(json.dumps(result, ensure_ascii=False))
         new = not results_path.exists()
         with open(results_path, "a", newline="", encoding="utf-8") as f:

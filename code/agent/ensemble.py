@@ -10,11 +10,12 @@ import logging
 import numpy as np
 
 from agent.core import CoreResult
-from agent.metrics import better, evaluate, safe_evaluate
+from agent.metrics import GREATER_IS_BETTER, better, evaluate, safe_evaluate
 
 log = logging.getLogger("solution")
 
 MAX_STEPS = 25
+BROKEN_GAP = 0.05
 
 
 def caruana(candidates: dict[str, CoreResult], y, metric: str, classes: list,
@@ -58,6 +59,27 @@ def caruana(candidates: dict[str, CoreResult], y, metric: str, classes: list,
     fold_scores = [safe_evaluate(metric, y_all[va], oof[va], classes) for _, va in folds.splits]
     log.info("ensemble: веса %s, %s OOF %.5f", counts, metric, best)
     return CoreResult(oof, mask, test_pred, best, fold_scores, 0), counts
+
+
+def mean_blend(candidates: dict[str, CoreResult], y, metric: str, classes: list, folds) -> CoreResult | None:
+    """Среднее вероятностей всех кандидатов для классификации. На holdout со сдвигом классов
+    (cls_shift) Caruana по OOF выбрал один xgb и после множителей классов дал F1 0,570, среднее —
+    0,592; без сдвига (cls_holdout) 0,638 против 0,638. Сломанного кандидата (хуже лучшего
+    по OOF больше чем на BROKEN_GAP) не берём."""
+    best = max(c.score for c in candidates.values()) if GREATER_IS_BETTER[metric] else \
+        min(c.score for c in candidates.values())
+    keep = {n: c for n, c in candidates.items() if abs(c.score - best) <= BROKEN_GAP * abs(best)}
+    if len(keep) < 2:
+        return None
+    results = list(keep.values())
+    mask = results[0].oof_mask
+    oof = np.mean([r.oof for r in results], axis=0)
+    test_pred = np.mean([r.test_pred for r in results], axis=0)
+    y = np.asarray(y)
+    score = evaluate(metric, y[mask], oof[mask], classes)
+    fold_scores = [safe_evaluate(metric, y[va], oof[va], classes) for _, va in folds.splits]
+    log.info("ensemble: среднее %d кандидатов %s, %s OOF %.5f", len(results), list(keep), metric, score)
+    return CoreResult(oof, mask, test_pred, score, fold_scores, 0)
 
 
 def median_blend(candidates: dict[str, CoreResult], y, metric: str, folds) -> CoreResult | None:

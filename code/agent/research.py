@@ -1,9 +1,12 @@
 """Цикл AutoResearch: LLM формулирует гипотезу, код её проверяет.
 
-Каждую итерацию LLM получает сводку: задачу, колонки с описаниями, текущий
-скор по фолдам, срезы с наибольшей ошибкой и журнал уже проверенных гипотез.
-Она возвращает одну гипотезу: операцию из меню (отношение, разность,
-групповой агрегат, удаление колонки) или короткую функцию на pandas.
+Каждую итерацию LLM получает сводку: задачу, план аналитика, колонки с описаниями,
+текущий скор по фолдам, срезы с наибольшей ошибкой и журнал уже проверенных гипотез.
+Она возвращает одну гипотезу: операцию из меню (отношение, разность, групповой
+агрегат, удаление колонки, колонка как категория, гиперпараметры LightGBM) или
+короткую функцию на pandas. Перед запуском гипотезу смотрит критик (второй вызов LLM
+без рассуждения): повтор журнала, таргет в признаке, бесполезное для деревьев
+преобразование — гипотеза не запускается, время уходит на следующую.
 
 Признак считается на train+test без таргета, проверяется на утечку и
 оценивается на тех же фолдах тем же правилом принятия, что и остальные шаги.
@@ -28,13 +31,26 @@ from agent.spec import TaskSpec
 
 log = logging.getLogger("solution")
 
-MAX_ITERS = 12
+# Число гипотез ограничивает в первую очередь дедлайн цикла. 12 гипотез на регрессии шли 5 минут,
+# на классификации 17, при лимите цикла 45 минут.
+MAX_ITERS = 25
 MAX_PROMPT_COLUMNS = 80
 MAX_TASK_CHARS = 2500
 CODE_TIMEOUT_S = 60
 LEAK_CORR = 0.995
 MIN_SLICE_ROWS = 30
-ACTIONS = ("ratio", "diff", "product", "group_mean", "group_std", "group_count", "freq", "drop", "code")
+ACTIONS = ("ratio", "diff", "product", "group_mean", "group_std", "group_count", "freq", "drop", "as_category",
+           "params", "code")
+# Гиперпараметры LightGBM, которые LLM может менять, и их допустимые границы.
+PARAM_RANGES = {"learning_rate": (0.01, 0.2), "num_leaves": (4, 512), "min_child_samples": (2, 1000),
+                "feature_fraction": (0.1, 1.0), "bagging_fraction": (0.3, 1.0), "lambda_l1": (0.0, 100.0),
+                "lambda_l2": (0.0, 100.0), "max_depth": (-1, 32), "min_split_gain": (0.0, 10.0),
+                "max_bin": (15, 1023), "cat_smooth": (1.0, 100.0), "min_data_per_group": (1, 1000),
+                "path_smooth": (0.0, 100.0), "extra_trees": (0, 1)}
+# Подбор параметров по CV переобучается под фолды быстрее, чем признаки: на синтетике LLM
+# тратила на него 18 гипотез из 25. Ограничиваем число попыток.
+MAX_PARAM_TRIALS = 6
+INT_PARAMS = ("num_leaves", "min_child_samples", "max_depth", "max_bin", "min_data_per_group")
 FORBIDDEN_CODE = ("import", "__", "open(", "exec", "eval", "compile", "globals", "locals", "getattr",
                   "setattr", "os.", "sys.", "subprocess", "read_csv", "to_csv")
 SAFE_BUILTINS = {k: getattr(builtins, k) for k in (
@@ -50,11 +66,18 @@ SCHEMA = {
         "columns": {"type": "array", "items": {"type": "string"}},
         "group_by": {"type": "string"},
         "code": {"type": "string"},
+        "params": {"type": "string"},
     },
-    # code и group_by обязательны (пустая строка, если не нужны): необязательные поля модель опускает,
-    # и все гипотезы с кодом приходили без кода.
-    "required": ["hypothesis", "action", "columns", "group_by", "code"],
+    # code, group_by и params обязательны (пустая строка, если не нужны): необязательные поля модель
+    # опускает, и все гипотезы с кодом приходили без кода.
+    "required": ["hypothesis", "action", "columns", "group_by", "code", "params"],
 }
+CRITIC_SCHEMA = {"type": "object", "properties": {"run": {"type": "boolean"}, "reason": {"type": "string"}},
+                 "required": ["run", "reason"]}
+CRITIC_SYSTEM = """You review hypotheses of an automated ML agent before they are run. Reject a hypothesis
+(run=false) ONLY if: it repeats or nearly repeats a journal entry; it uses the target column or information
+unavailable at prediction time; it is a monotone transform of a single column (useless for trees); or it is
+obviously meaningless. Otherwise approve (run=true). Answer with JSON only."""
 
 SYSTEM = """You are a senior data scientist inside an automated ML agent.
 Each turn you propose ONE hypothesis that may improve the cross-validation score of a gradient boosting model
@@ -70,12 +93,19 @@ ACTION_HELP = """Allowed actions:
 - group_count: columns=[], group_by=g -> number of rows with the same g
 - freq: columns=[a] -> share of rows with the same value of a
 - drop: columns=[a, ...] -> remove noisy or shifted columns
+- as_category: columns=[a, ...] -> treat numeric codes as categories instead of numbers
+- params: params = JSON object with LightGBM parameters to change, e.g. "{\"num_leaves\": 15,
+  \"min_child_samples\": 100}". Allowed keys: {PARAMS}. Use it when the journal shows
+  overfitting or underfitting rather than a missing feature. At most {MAX_PARAM} params trials per run:
+  features usually matter more.
 - code: columns=[columns you use], code = Python defining `def feature(df):` that returns a pandas Series of
   len(df). df holds train and test feature rows together WITHOUT the target. Only `np` and `pd` are available,
   no imports, no file access. Keep it vectorized and short. The "code" field is REQUIRED for this action, e.g.
   "def feature(df):
     return df['a'] / df.groupby('g')['a'].transform('median')"
-Monotone transforms of a single column (log, sqrt, scaling) do not help tree models: do not propose them."""
+Monotone transforms of a single column (log, sqrt, scaling) do not help tree models: do not propose them.
+Fields that the action does not use must be empty strings."""
+ACTION_HELP = ACTION_HELP.replace("{PARAMS}", ", ".join(PARAM_RANGES)).replace("{MAX_PARAM}", str(MAX_PARAM_TRIALS))
 
 
 @dataclass
@@ -90,6 +120,7 @@ class Trial:
     score: float | None
     before: float
     note: str = ""
+    params: dict | None = None
 
 
 def describe_columns(train: pd.DataFrame, features: list[str], dictionary: pd.DataFrame | None) -> str:
@@ -146,17 +177,22 @@ def error_slices(train: pd.DataFrame, spec: TaskSpec, result) -> str:
 
 
 def build_prompt(task_text: str, spec: TaskSpec, train: pd.DataFrame, features: list[str],
-                 dictionary: pd.DataFrame | None, result, scheme: str, journal: list[Trial]) -> str:
+                 dictionary: pd.DataFrame | None, result, scheme: str, journal: list[Trial],
+                 plan: str = "", params: dict | None = None) -> str:
     direction = "higher is better" if GREATER_IS_BETTER[spec.metric] else "lower is better"
     history = "\n".join(
-        f"- [{t.status}] {t.action} {t.columns} {t.group_by or ''}: {t.hypothesis[:140]}"
+        f"- [{t.status}] {t.action} {t.columns} {t.group_by or ''}{t.params or ''}: {t.hypothesis[:140]}"
         + (f" -> {t.score:.5g} vs {t.before:.5g}" if t.score is not None else f" ({t.note[:80]})")
         for t in journal) or "- nothing yet"
     return f"""Task description (from task.md):
 {task_text[:MAX_TASK_CHARS]}
 
+Research plan written by the analyst before modelling:
+{plan or "- none"}
+
 Target: {spec.target}; task type: {spec.kind}; metric: {spec.metric} ({direction}); validation: {scheme}.
 Current CV score: {result.score:.5g}; per fold: {[round(s, 5) for s in result.fold_scores]}
+LightGBM changes accepted so far: {params or DEFAULTS_NOTE}; trees in final model: {result.rounds}
 
 Columns (name | dtype | unique | missing | description):
 {describe_columns(train, features, dictionary)}
@@ -171,6 +207,10 @@ Journal of tried hypotheses:
 
 The target column `{spec.target}` is NOT available to features (no target encoding).
 Propose the single most promising NEW hypothesis."""
+
+
+DEFAULTS_NOTE = ("none (defaults: learning_rate 0.05, num_leaves 63, min_child_samples 20, feature_fraction 0.8, "
+                 "bagging_fraction 0.8, lambda_l2 1)")
 
 
 def run_code(code: str, frame: pd.DataFrame) -> pd.Series:
@@ -213,8 +253,35 @@ def make_feature(action: str, cols: list[str], group_by: str | None, code: str |
     return num(cols[0]).groupby(key).transform(stat)
 
 
-def validate(action: str, cols: list[str], group_by: str | None, code: str | None, columns: set[str]) -> str | None:
+def parse_params(text) -> dict:
+    """Параметры LightGBM от LLM: только известные ключи, значения обрезаем по границам."""
+    if isinstance(text, dict):
+        raw = text
+    else:
+        try:
+            raw = json.loads(text or "")
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    out = {}
+    for key, value in (raw.items() if isinstance(raw, dict) else []):
+        if key not in PARAM_RANGES:
+            continue
+        try:
+            lo, hi = PARAM_RANGES[key]
+            value = min(max(float(value), lo), hi)
+        except (TypeError, ValueError):
+            continue
+        out[key] = int(round(value)) if key in INT_PARAMS else value
+    if "extra_trees" in out:
+        out["extra_trees"] = bool(out["extra_trees"] >= 0.5)
+    return out
+
+
+def validate(action: str, cols: list[str], group_by: str | None, code: str | None, columns: set[str],
+             params: dict | None = None) -> str | None:
     """Текст ошибки или None. Проверяем имена до того, как что-то считать."""
+    if action == "params":
+        return None if params else "нет допустимых параметров или исчерпан лимит попыток: предложи признак"
     unknown = [c for c in cols + ([group_by] if group_by else []) if c not in columns]
     if action != "code" and unknown:
         return f"нет колонок {unknown}"
@@ -223,8 +290,8 @@ def validate(action: str, cols: list[str], group_by: str | None, code: str | Non
         return f"для {action} нужно {need[action]} колонки"
     if action.startswith("group_") and not group_by:
         return "нет group_by"
-    if action == "drop" and not cols:
-        return "нечего удалять"
+    if action in ("drop", "as_category") and not cols:
+        return "не указаны колонки"
     if action == "code" and not code:
         return "для code нужно поле code с функцией feature(df)"
     return None
@@ -248,10 +315,23 @@ def ask_metric(llm: LLM, task_text: str, kind: str, allowed: list[str]) -> str |
     return None
 
 
+def critique(llm: LLM, trial: Trial, journal: list[Trial], target: str) -> tuple[bool, str]:
+    """Критик: быстрый вызов без рассуждения. Не ответил — гипотезу запускаем."""
+    history = "\n".join(f"- {t.action} {t.columns} {t.group_by or ''}{t.params or ''}: {t.hypothesis[:100]}"
+                        for t in journal[-15:]) or "- empty"
+    answer = llm.ask_json(CRITIC_SYSTEM, f"Target column: {target}\nJournal:\n{history}\n\nNew hypothesis: "
+                                         f"{trial.action} columns={trial.columns} group_by={trial.group_by} "
+                                         f"params={trial.params} code={trial.code}\n{trial.hypothesis}",
+                          CRITIC_SCHEMA, "review", fast=True)
+    if not answer:
+        return True, ""
+    return bool(answer.get("run", True)), str(answer.get("reason", ""))[:300]
+
+
 def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictionary: pd.DataFrame | None,
-                  evaluate_stage, deadline: float, journal_path: Path) -> list[Trial]:
-    """evaluate_stage(name, train, test) -> (принят ли, скор кандидата): оценивает вариант
-    признаков и, если он выиграл по правилу принятия, делает его текущим (и пишет сабмит)."""
+                  evaluate_stage, deadline: float, journal_path: Path, plan: str = "") -> list[Trial]:
+    """evaluate_stage(name, train, test, params) -> (принят ли, скор кандидата): оценивает вариант
+    признаков и параметров и, если он выиграл по правилу принятия, делает его текущим (и пишет сабмит)."""
     journal: list[Trial] = []
     for it in range(MAX_ITERS):
         if not llm.enabled or time.monotonic() > deadline:
@@ -261,7 +341,7 @@ def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictio
         features = [c for c in state.train.columns if c not in (spec.id_col, spec.target)]
         before = state.result.score
         prompt = build_prompt(task_text, spec, state.train, features, dictionary, state.result,
-                              folds.scheme, journal)
+                              folds.scheme, journal, plan, state.params)
         answer = llm.ask_json(SYSTEM, prompt, SCHEMA, "hypothesis")
         if answer is None:
             continue
@@ -273,10 +353,17 @@ def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictio
         group_by = str(group_by) if group_by else None
         code = answer.get("code") or None
         code = str(code) if code else None
+        params = parse_params(answer.get("params")) if action == "params" else None
+        if action == "params" and sum(t.action == "params" for t in journal) >= MAX_PARAM_TRIALS:
+            params = None  # validate отметит гипотезу как invalid, LLM увидит это в журнале
         trial = Trial(it, str(answer.get("hypothesis", ""))[:500], action, cols, group_by, code, "invalid", None,
-                      before)
+                      before, params=params)
         error = "неизвестное действие" if action not in ACTIONS else validate(action, cols, group_by, code,
-                                                                                  set(features))
+                                                                                  set(features), params)
+        if error is None:
+            run, reason = critique(llm, trial, journal, spec.target)
+            if not run:
+                error, trial.status = f"критик: {reason}", "vetoed"
         if error is None:
             try:
                 accepted, score, note = try_hypothesis(trial, state, spec, features, evaluate_stage)
@@ -286,8 +373,8 @@ def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictio
         else:
             trial.note = error
         journal.append(trial)
-        log.info("research %d: [%s] %s %s %s — %s", it, trial.status, action, cols, group_by or "",
-                 trial.hypothesis[:150])
+        log.info("research %d: [%s] %s %s %s%s — %s", it, trial.status, action, cols, group_by or "",
+                 params or "", trial.hypothesis[:150])
         try:
             with open(journal_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(asdict(trial), ensure_ascii=False) + "\n")
@@ -301,10 +388,23 @@ def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictio
 
 def try_hypothesis(trial: Trial, state, spec: TaskSpec, features: list[str], evaluate_stage):
     train, test = state.train, state.test
+    if trial.action == "params":
+        params = {**(state.params or {}), **trial.params}
+        ok, score = evaluate_stage(f"research params {trial.params}", train, test, params)
+        return ok, score, ""
     if trial.action == "drop":
         keep = [c for c in train.columns if c not in trial.columns]
         ok, score = evaluate_stage(f"research drop {trial.columns}", train[keep],
-                                   test[[c for c in keep if c in test]])
+                                   test[[c for c in keep if c in test]], state.params)
+        return ok, score, ""
+    if trial.action == "as_category":
+        def as_cat(frame: pd.DataFrame) -> pd.DataFrame:
+            out = frame.copy()
+            for c in trial.columns:
+                out[c] = frame[c].astype("string")
+            return out
+        ok, score = evaluate_stage(f"research as_category {trial.columns}", as_cat(train), as_cat(test),
+                                   state.params)
         return ok, score, ""
 
     frame = pd.concat([train[features], test[features]], ignore_index=True)
@@ -325,5 +425,5 @@ def try_hypothesis(trial: Trial, state, spec: TaskSpec, features: list[str], eva
     name = f"llm_{trial.iteration}_{trial.action}"
     new_train = train.assign(**{name: v_tr})
     new_test = test.assign(**{name: v_te})
-    ok, score = evaluate_stage(f"research {name}", new_train, new_test)
+    ok, score = evaluate_stage(f"research {name}", new_train, new_test, state.params)
     return ok, score, ""
