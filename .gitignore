@@ -9,3 +9,4 @@
 !Многоклассовая классификация/data_dictionary.csv
 
 __pycache__/
+code/bench/openml_cache/

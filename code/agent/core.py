@@ -29,11 +29,18 @@ TRANSFORMS = {"log1p": (np.log1p, np.expm1)}
 DATE_SAMPLE, DATE_SHARE = 500, 0.95
 MAX_CAT_LEVELS, MAX_CAT_SHARE = 1000, 0.5
 L1_METRICS = ("mae", "medae", "smape")
+# Относительные метрики: ошибка в логарифмах, поэтому модель по умолчанию учится на log1p(y).
+LOG_METRICS = ("rmsle", "msle", "mape")
 # На всём train данных больше, чем в любом фолде, поэтому раундов при рефите больше среднего.
 REFIT_MULT = 1.1
 MIN_FIT_ROWS, MIN_STOP_ROWS = 200, 50
 # Имя параметра seed у каждой библиотеки: при рефите на нескольких seed его подменяем.
-SEED_KEY = {"lgb": "seed", "cat": "random_seed", "xgb": "seed"}
+SEED_KEY = {"lgb": "seed", "cat": "random_seed", "xgb": "seed", "linear": "seed", "et": "seed"}
+# Линейная модель и ExtraTrees: на маленьких и «линейных» данных набора (moneyball, credit,
+# wine) бустинги проигрывали простым бейзлайнам именно этих семейств.
+LINEAR_SKEW, LINEAR_MAX_LEVELS, LINEAR_CLIP, LINEAR_MAX_ITER = 2.0, 30, 5.0, 2000
+ET_TREES, ET_MIN_LEAF, ET_MAX_FEATURES = 300, 2, 0.5
+TREE_NAN = -999.0
 
 
 @dataclass
@@ -124,9 +131,8 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) -> tup
 
 def lgb_objective(spec: TaskSpec) -> dict:
     if spec.kind == "regression":
-        # Для MAE-подобных метрик оптимум — медиана, для MAPE — взвешенная медиана.
-        if spec.metric == "mape":
-            return {"objective": "mape"}
+        # Для MAE-подобных метрик оптимум — медиана. MAPE и RMSLE учим на log1p(y) с L2 (см. LOG_METRICS):
+        # objective mape у LightGBM упирался в 5000 раундов и давал 0,078 против 0,060 на диамантах.
         return {"objective": "l1" if spec.metric in L1_METRICS else "l2"}
     if spec.kind == "binary":
         return {"objective": "binary"}
@@ -138,6 +144,13 @@ def encode_target(y: pd.Series, spec: TaskSpec) -> np.ndarray:
         return y.to_numpy(dtype=float)
     index = {str(c): i for i, c in enumerate(spec.classes)}
     return y.astype(str).map(index).to_numpy()
+
+
+def default_transform(spec: TaskSpec, y: np.ndarray) -> str | None:
+    """log1p для относительных метрик при неотрицательном таргете, иначе без преобразования."""
+    if spec.kind == "regression" and spec.metric in LOG_METRICS and np.nanmin(y) >= 0:
+        return "log1p"
+    return None
 
 
 class OutOfTime(Exception):
@@ -177,7 +190,7 @@ def _fit_lgb(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
 
 def _fit_cat(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
     from catboost import CatBoostClassifier, CatBoostRegressor
-    loss = {"regression": "MAPE" if spec.metric == "mape" else "MAE" if spec.metric in L1_METRICS else "RMSE",
+    loss = {"regression": "MAE" if spec.metric in L1_METRICS else "RMSE",
             "binary": "Logloss",
             "multiclass": "MultiClass"}[spec.kind]
     cls = CatBoostRegressor if spec.kind == "regression" else CatBoostClassifier
@@ -198,7 +211,7 @@ def _fit_cat(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
 
 def _fit_xgb(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
     import xgboost as xgb
-    objective = {"regression": "reg:absoluteerror" if spec.metric in L1_METRICS + ("mape",) else "reg:squarederror",
+    objective = {"regression": "reg:absoluteerror" if spec.metric in L1_METRICS else "reg:squarederror",
                  "binary": "binary:logistic", "multiclass": "multi:softprob"}[spec.kind]
     base = {**dict(objective=objective, learning_rate=0.05, max_depth=7, subsample=0.8, colsample_bytree=0.8,
                    min_child_weight=3, tree_method="hist", max_cat_to_onehot=1, nthread=N_JOBS, seed=0), **params}
@@ -233,11 +246,80 @@ def _fit_xgb(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
     return preds, rounds
 
 
-FITTERS = {"lgb": _fit_lgb, "cat": _fit_cat, "xgb": _fit_xgb}
+def _stack(x_fit, y_fit, x_stop, y_stop):
+    """Моделям без ранней остановки отдаём и часть для остановки: данных больше."""
+    if x_stop is None:
+        return x_fit, y_fit
+    return pd.concat([x_fit, x_stop]), np.concatenate([y_fit, y_stop])
+
+
+class _LinearDesign:
+    """Матрица для линейной модели: медиана вместо пропуска плюс флаг, знаковый log1p для
+    сильно скошенных чисел, one-hot по частым уровням категорий, стандартизация по fit."""
+
+    def __init__(self, x: pd.DataFrame):
+        self.cats = [c for c in x.columns if isinstance(x[c].dtype, pd.CategoricalDtype)]
+        self.nums = [c for c in x.columns if c not in self.cats]
+        num = x[self.nums].astype(float)
+        self.median = num.median()
+        self.flags = [c for c in self.nums if num[c].isna().any()]
+        self.skewed = [c for c in self.nums if abs(num[c].skew()) > LINEAR_SKEW]
+        self.levels = {c: x[c].value_counts().index[:LINEAR_MAX_LEVELS].tolist() for c in self.cats}
+        raw = self._raw(x)
+        self.mean, self.std = raw.mean(0), raw.std(0) + 1e-9
+
+    def _raw(self, x: pd.DataFrame) -> np.ndarray:
+        num = x[self.nums].astype(float)
+        parts = [num[self.flags].isna().to_numpy(np.float32)]
+        num = num.fillna(self.median).fillna(0)
+        for c in self.skewed:
+            num[c] = np.sign(num[c]) * np.log1p(np.abs(num[c]))
+        parts.append(num.to_numpy(np.float32))
+        for c in self.cats:
+            parts.append(np.column_stack([(x[c] == v).to_numpy(np.float32) for v in self.levels[c]])
+                         if self.levels[c] else np.zeros((len(x), 0), np.float32))
+        return np.hstack(parts)
+
+    def __call__(self, x: pd.DataFrame) -> np.ndarray:
+        # Обрезка защищает от единичных экстремумов в test, которые линейная модель экстраполирует.
+        return np.clip((self._raw(x) - self.mean) / self.std, -LINEAR_CLIP, LINEAR_CLIP)
+
+
+def _fit_linear(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
+    from sklearn.linear_model import LogisticRegression, RidgeCV
+    x_fit, y_fit = _stack(x_fit, y_fit, x_stop, y_stop)
+    design = _LinearDesign(x_fit)
+    if spec.kind == "regression":
+        model = RidgeCV(alphas=np.logspace(-2, 3, 6)).fit(design(x_fit), y_fit)
+        return [model.predict(design(x)) for x in to_predict], 1
+    model = LogisticRegression(C=params.get("C", 1.0), max_iter=LINEAR_MAX_ITER).fit(design(x_fit), y_fit)
+    return [_to_proba(model.predict_proba(design(x)), model.classes_, spec) for x in to_predict], 1
+
+
+def _tree_frame(x: pd.DataFrame) -> np.ndarray:
+    x = x.copy()
+    for c in x.columns:
+        if isinstance(x[c].dtype, pd.CategoricalDtype):
+            x[c] = x[c].cat.codes
+    return x.astype(float).fillna(TREE_NAN).to_numpy(np.float32)
+
+
+def _fit_et(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
+    from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
+    x_fit, y_fit = _stack(x_fit, y_fit, x_stop, y_stop)
+    cls = ExtraTreesRegressor if spec.kind == "regression" else ExtraTreesClassifier
+    model = cls(n_estimators=ET_TREES, min_samples_leaf=ET_MIN_LEAF, max_features=ET_MAX_FEATURES, n_jobs=N_JOBS,
+                random_state=params.get("seed", 0)).fit(_tree_frame(x_fit), y_fit)
+    if spec.kind == "regression":
+        return [model.predict(_tree_frame(x)) for x in to_predict], 1
+    return [_to_proba(model.predict_proba(_tree_frame(x)), model.classes_, spec) for x in to_predict], 1
+
+
+FITTERS = {"lgb": _fit_lgb, "cat": _fit_cat, "xgb": _fit_xgb, "linear": _fit_linear, "et": _fit_et}
 
 
 def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Folds,
-             params_override: dict | None = None, family: str = "lgb", transform: str | None = None,
+             params_override: dict | None = None, family: str = "lgb", transform: str | None = "auto",
              deadline: float | None = None, name: str = "core", refit_mult: float = REFIT_MULT,
              repeats: np.ndarray | None = None, residual_of: str | None = None,
              fallback: CoreResult | None = None, seeds: int = 1) -> CoreResult:
@@ -252,6 +334,8 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
     features = feature_columns(train, spec, test)
     x, x_test = prepare(train, test, features)
     y = encode_target(train[spec.target], spec)
+    if transform == "auto":
+        transform = default_transform(spec, y)
     forward, back = TRANSFORMS.get(transform, (None, None))
     to_model = forward or (lambda v: v)
     from_model = back or (lambda v: v)
@@ -299,6 +383,9 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
                 no_base = ~rows[va]
                 oof[va[no_base]] = fallback.oof[va[no_base]]
             rounds.append(r)
+        if spec.kind == "regression":
+            # Та же обрезка, что у test (см. ниже), по диапазону train-части фолда.
+            oof[va] = np.clip(oof[va], np.nanmin(y[tr]), np.nanmax(y[tr]))
         mask[va] = True
         fold_scores.append(safe_evaluate(spec.metric, train[spec.target].iloc[va], oof[va], spec.classes))
         log.info("%s fold %d: %s=%.5f, %.0f с", name, i, spec.metric, fold_scores[-1], time.monotonic() - t0)
@@ -306,6 +393,8 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
     if not rounds:
         raise ValueError(f"{name}: ни один фолд не обучился")
     score = evaluate(spec.metric, train[spec.target][mask], oof[mask], spec.classes)
+    # Раунды для рефита — со всех фолдов. Пробовали брать только фолды с остановкой по следующему
+    # периоду (там раундов в 2–4 раза меньше): reg_h5 стал хуже, 28,91 → 29,46, reg_h4 без изменений.
     full_rounds = max(50, int(np.mean(rounds) * refit_mult))
     refit = []
     for seed in range(max(1, seeds)):
@@ -315,6 +404,10 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
                             y_model[expand(np.arange(n))], None, None, [x_test], full_rounds)
         refit.append(pred)
     test_pred = restore(np.mean(refit, axis=0), base_te)
+    if spec.kind == "regression":
+        # Линейная модель экстраполирует: на house_prices она предсказала 940 тыс. при максимуме
+        # train 755 тыс. Деревья за диапазон train не выходят, обрезка их не меняет.
+        test_pred = np.clip(test_pred, np.nanmin(y), np.nanmax(y))
     if fallback is not None and base_te is not None:
         no_base = np.isnan(base_te)
         test_pred[no_base] = fallback.test_pred[no_base]

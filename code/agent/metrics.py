@@ -65,20 +65,26 @@ def evaluate(metric: str, y_true, pred: np.ndarray, classes: list | None = None)
             auc = float(skm.roc_auc_score(hit, score))
             return 2 * auc - 1 if metric == "gini" else auc
         return float(skm.roc_auc_score(y_true, pred, multi_class="ovr", labels=classes))
-    labels = to_labels(pred, classes)
+    # Метки сравниваем строками: to_labels отдаёт object-массив, и при целых классах (1, 2)
+    # sklearn видит «mix of binary and unknown targets» и падает (s_phoneme на стенде).
+    labels = to_labels(pred, classes).astype(str)
+    y_s, names = y_true.astype(str), [str(c) for c in classes]
     if metric == "accuracy":
-        return float(skm.accuracy_score(y_true, labels))
+        return float(skm.accuracy_score(y_s, labels))
     if metric == "balanced_accuracy":
-        return float(skm.balanced_accuracy_score(y_true, labels))
+        return float(skm.balanced_accuracy_score(y_s, labels))
     if metric == "mcc":
-        return float(skm.matthews_corrcoef(y_true, labels))
+        return float(skm.matthews_corrcoef(y_s, labels))
     if metric in ("kappa", "qwk"):
-        return float(skm.cohen_kappa_score(y_true, labels, weights="quadratic" if metric == "qwk" else None,
-                                           labels=classes))
+        # Для QWK порядок классов важен: classes отсортированы, строки «10» и «9» — нет.
+        order = {name: i for i, name in enumerate(names)}
+        return float(skm.cohen_kappa_score([order[v] for v in y_s], [order[v] for v in labels],
+                                           weights="quadratic" if metric == "qwk" else None,
+                                           labels=list(range(len(names)))))
     if metric == "f1_binary":
-        return float(skm.f1_score(y_true, labels, average="binary", pos_label=positive_class(classes, y_true)))
+        return float(skm.f1_score(y_s, labels, average="binary", pos_label=str(positive_class(classes, y_true))))
     average = "weighted" if metric == "f1_weighted" else "macro"
-    return float(skm.f1_score(y_true, labels, average=average, labels=classes))
+    return float(skm.f1_score(y_s, labels, average=average, labels=names))
 
 
 def safe_evaluate(metric: str, y_true, pred: np.ndarray, classes: list | None = None) -> float:

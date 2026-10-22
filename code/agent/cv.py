@@ -36,6 +36,12 @@ class Folds:
 MIN_FIT_PERIODS = 2
 
 
+def stops_forward(folds: Folds, tr: np.ndarray) -> bool:
+    """Остановка по следующему периоду (как устроен test) или по случайной части: во втором
+    случае число раундов завышено, и для рефита его брать нельзя (см. core.run_core)."""
+    return folds.periods is not None and len(np.unique(folds.periods[tr])) > MIN_FIT_PERIODS
+
+
 def inner_split(folds: Folds, tr: np.ndarray, share: float = INNER_SHARE) -> tuple[np.ndarray, np.ndarray]:
     """Делим train-часть фолда на обучение и early stopping. Останавливаться по val
     фолда нельзя: OOF тогда оптимистичен (на регрессии на 2,6 RMSE).
@@ -46,11 +52,10 @@ def inner_split(folds: Folds, tr: np.ndarray, share: float = INNER_SHARE) -> tup
     сущности на фолде пустые: на reg_h4 (3 года) история отклонялась как бесполезная, хотя
     одно «значение прошлого года» давало RMSE 23 против 40 у модели."""
     rng = np.random.default_rng(SEED)
-    if folds.periods is not None:
+    if stops_forward(folds, tr):
         p = folds.periods[tr]
-        if len(np.unique(p)) > MIN_FIT_PERIODS:
-            last = p == p.max()
-            return tr[~last], tr[last]
+        last = p == p.max()
+        return tr[~last], tr[last]
     if folds.groups is not None:
         g = np.unique(folds.groups[tr])
         stop_groups = rng.choice(g, max(1, int(len(g) * share)), replace=False)

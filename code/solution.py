@@ -23,9 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent.adversarial import adversarial  # noqa: E402
 from agent.analyst import Plan, analyze, profile, verify  # noqa: E402
-from agent.core import CoreResult, OutOfTime, run_core  # noqa: E402
+from agent.core import LOG_METRICS, CoreResult, OutOfTime, run_core  # noqa: E402
 from agent.cv import Folds, make_folds  # noqa: E402
-from agent.ensemble import mean_blend, median_blend  # noqa: E402
+from agent.ensemble import caruana, hedge_blend, mean_blend, median_blend  # noqa: E402
 from agent.entity import add_history, add_lags, find_key  # noqa: E402
 from agent.metrics import GREATER_IS_BETTER, NONNEG_METRICS, POSITIVE_NAMES, better, to_labels  # noqa: E402
 from agent.llm import LLM  # noqa: E402
@@ -40,19 +40,21 @@ log = logging.getLogger("solution")
 
 MIN_FOLD_WIN_SHARE = 0.7
 MIN_REL_GAIN = 0.002
-# Новые модели зоопарка не запускаем позже этого срока от старта. Лимит платформы 3 ч,
-# запас на случай, если её CPU медленнее нашего стенда.
-ZOO_DEADLINE_S = 100 * 60
+MIN_ERR_GAIN = 0.005
+# Новые модели зоопарка не запускаем позже этого срока от старта. Лимит платформы 3 ч, её CPU
+# примерно в 1,5 раза медленнее стенда (6200–6800 с на две задачи против ~4200 с у нас).
+# Перерасход не смертелен: ансамбль пишется после каждой модели (checkpoint в main).
+ZOO_DEADLINE_S = 140 * 60
 # Цикл гипотез LLM не дольше этого срока от старта: дальше время нужно зоопарку.
-RESEARCH_DEADLINE_S = 45 * 60
+RESEARCH_DEADLINE_S = 60 * 60
 # Потолок на одну модель: CatBoost на 10 классах шёл 28 минут и смесь не улучшил.
-MODEL_MAX_S = 15 * 60
+MODEL_MAX_S = 20 * 60
 # CatBoost MultiClass на 10 классах и 87 тыс. строк шёл 15 минут на фолд: потолок срабатывает
 # только после первого фолда, поэтому при многих классах его не запускаем вовсе.
 MAX_CAT_CLASSES = 5
 FORWARD_REFIT_MULT = 2.5
-# Рефит кандидатов зоопарка на нескольких seed: из 3 часов агент тратит меньше получаса.
-REFIT_SEEDS = 3
+# Рефит кандидатов зоопарка на нескольких seed: время есть, дисперсия test ниже.
+REFIT_SEEDS = 5
 LAST_PERIOD_REPEATS = 3
 ZOO = [
     ("lgb_slow", "lgb", dict(learning_rate=0.03, num_leaves=15, min_child_samples=50, feature_fraction=0.6)),
@@ -60,7 +62,14 @@ ZOO = [
     ("xgb", "xgb", {}),
     ("lgb_deep", "lgb", dict(learning_rate=0.03, num_leaves=255, min_child_samples=10, lambda_l2=5.0,
                               feature_fraction=0.5)),
+    ("linear", "linear", {}),
+    ("et", "et", {}),
+    # Медленная и точная конфигурация в конце: если времени не хватит, теряем только её.
+    ("lgb_fine", "lgb", dict(learning_rate=0.01, num_leaves=31, min_child_samples=20, feature_fraction=0.7)),
 ]
+# Сдвиг train/test: adversarial AUC выше порога. На проверочном наборе случайные сплиты дают
+# 0,49–0,54, публичные задачи и holdout со сдвигом — 0,89–1,0.
+SHIFT_AUC = 0.7
 
 
 @dataclass
@@ -111,7 +120,9 @@ def wins(metric: str, new: CoreResult, old: CoreResult) -> bool:
     if not pairs:
         return False
     worse = [better(metric, b, a) for a, b in pairs]
-    margin = MIN_REL_GAIN * abs(old.score)
+    # Для ошибок порог от самой ошибки, для метрик качества с максимумом 1 — от оставшейся ошибки:
+    # 0,2% от R² 0,98 требовали срезать 10% остаточной ошибки, и на cpu_act ансамбль не прошёл.
+    margin = MIN_REL_GAIN * abs(old.score) if not GREATER_IS_BETTER[metric] else MIN_ERR_GAIN * max(1 - old.score, 0)
     # Штрафуем новый вариант на margin: он должен выиграть с запасом.
     shifted = new.score - margin if GREATER_IS_BETTER[metric] else new.score + margin
     return better(metric, shifted, old.score) and 1 - np.mean(worse) >= MIN_FOLD_WIN_SHARE
@@ -204,10 +215,10 @@ def main(task_path: Path) -> None:
     report.step("ядро: LightGBM на всех признаках", "база", best.score, None)
     report.write()
 
-    shifted = None
+    shifted, shift_auc = None, None
     try:
         adv = adversarial(train, test, features)
-        shifted = adv.top
+        shifted, shift_auc = adv.top, adv.auc
         report.facts["Сдвиг train/test"] = f"adversarial AUC {adv.auc:.3f}, сильнее всего {adv.top}"
     except Exception:
         log.exception("adversarial validation упала, идём дальше")
@@ -322,13 +333,55 @@ def main(task_path: Path) -> None:
     report.models = candidates
     transforms = [None]
     if spec.kind == "regression" and train[spec.target].min() >= 0:
-        transforms.append("log1p")
+        # Для относительных метрик сырой таргет не нужен: модели на нём заметно хуже.
+        transforms = ["log1p"] if spec.metric in LOG_METRICS else [None, "log1p"]
     forward = folds.scheme == "time_forward"
     extra = {}
     if forward:
         last = state.train[folds.period_col] == state.train[folds.period_col].max()
         extra = dict(refit_mult=FORWARD_REFIT_MULT, repeats=np.where(last, LAST_PERIOD_REPEATS, 1))
     residual = "ent_last" if spec.kind == "regression" and "ent_last" in state.train.columns else None
+    # Финал. Если test сдвинут относительно train (или валидация по времени), OOF плохо
+    # предсказывает test: на holdout со сдвигом отбор по OOF проигрывал усреднению, поэтому
+    # берём медиану (регрессия) или среднее вероятностей (классификация) всех моделей.
+    # Без сдвига OOF надёжен, и веса подбирает Caruana: на наборе OpenML так линейная модель
+    # или ExtraTrees получают вес там, где они лучше бустингов.
+    robust = folds.scheme == "time_forward" or shift_auc is None or shift_auc > SHIFT_AUC
+    report.facts["Финал"] = ("усреднение всех моделей (есть сдвиг train/test)" if robust
+                             else "среднее Caruana по OOF и усреднения всех моделей (сдвига нет)")
+
+    def blend() -> Stage | None:
+        y = state.train[spec.target]
+        if spec.kind == "regression":
+            mixed = median_blend(candidates, y, spec.metric, folds)
+        else:
+            mixed = mean_blend(candidates, y, spec.metric, spec.classes, folds)
+        if not robust:
+            weighted = caruana(candidates, y, spec.metric, spec.classes, folds)
+            if weighted and mixed:
+                mixed = hedge_blend(weighted[0], mixed, y, spec.metric, spec.classes, folds)
+            elif weighted:
+                mixed = weighted[0]
+        return None if mixed is None else Stage(state.train, state.test, mixed, None, state.params)
+    def accept_blend(mixed: Stage) -> bool:
+        """Смесь готовых моделей ничего не добавляет, только снижает дисперсию, поэтому порог
+        против шумных гипотез к ней не применяем: достаточно не проиграть по OOF. При сдвиге
+        классификация берёт среднее без отбора (OOF на сдвиге обманывает)."""
+        return (spec.kind != "regression" and robust) or not better(spec.metric, state.result.score,
+                                                                     mixed.result.score)
+
+    def checkpoint() -> None:
+        """Ансамбль после каждой новой модели: если платформа убьёт процесс посреди зоопарка,
+        на диске останется лучший готовый ансамбль, а не одиночная модель."""
+        if len(candidates) < 3:
+            return
+        try:
+            mixed = blend()
+            if mixed is not None and accept_blend(mixed):
+                submit(mixed.result, f"промежуточный ансамбль из {len(candidates)} моделей")
+        except Exception:
+            log.exception("промежуточный ансамбль упал")
+
     deadline = started + ZOO_DEADLINE_S
     plan = [(f"{name}+{t}" if t else name, family, params, t) for t in transforms
             for name, family, params in [("lgb", "lgb", {})] + ZOO]
@@ -350,6 +403,7 @@ def main(task_path: Path) -> None:
                     state.train, state.test, spec, folds, params, family, transform,
                     min(deadline, time.monotonic() + MODEL_MAX_S), name + "+resid", residual_of=residual,
                     fallback=candidates[name], seeds=REFIT_SEEDS, **extra)
+            checkpoint()
         except OutOfTime as error:
             log.info("zoo: %s", error)
         except Exception:
@@ -365,28 +419,17 @@ def main(task_path: Path) -> None:
         except Exception:
             log.exception("кандидаты не сохранились")
 
-    # Финал без отбора по OOF: медиана для регрессии, среднее вероятностей для классификации.
-    # На четырёх holdout отбор лучшего по OOF проигрывал усреднению там, где test сдвинут
-    # относительно train, и не выигрывал там, где не сдвинут (журнал, 22.10).
-    def blend() -> Stage | None:
-        y = state.train[spec.target]
-        if spec.kind == "regression":
-            mixed = median_blend(candidates, y, spec.metric, folds)
-        else:
-            mixed = mean_blend(candidates, y, spec.metric, spec.classes, folds)
-        return None if mixed is None else Stage(state.train, state.test, mixed, None, state.params)
-    if spec.kind == "regression":
-        attempt("ensemble", blend)
-    else:
-        try:
-            mixed = blend()
-            if mixed is not None:
-                report.step("ensemble: среднее всех моделей", "принято без отбора", mixed.result.score,
-                            state.result.score)
-                state.__dict__.update(mixed.__dict__)
-                submit(state.result, "ensemble")
-        except Exception:
-            log.exception("ensemble упал, остаётся прошлый сабмит")
+    try:
+        mixed = blend()
+        if mixed is not None and accept_blend(mixed):
+            report.step("ensemble: " + report.facts["Финал"], "принято", mixed.result.score, state.result.score)
+            state.__dict__.update(mixed.__dict__)
+        elif mixed is not None:
+            report.step("ensemble", "отклонено", mixed.result.score, state.result.score)
+    except Exception:
+        log.exception("ensemble упал, остаётся прошлый сабмит")
+    # Промежуточный ансамбль мог лечь в файл, даже если итоговый не принят: пишем итог явно.
+    submit(state.result, "итог")
     report.write()
 
     if spec.kind != "regression" and not spec.proba_output:

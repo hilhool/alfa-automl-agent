@@ -61,6 +61,18 @@ def caruana(candidates: dict[str, CoreResult], y, metric: str, classes: list,
     return CoreResult(oof, mask, test_pred, best, fold_scores, 0), counts
 
 
+def hedge_blend(a: CoreResult, b: CoreResult, y, metric: str, classes: list, folds) -> CoreResult:
+    """Среднее двух смесей. На проверочном наборе OpenML (14 задач без сдвига) Caruana по OOF
+    в среднем лучше простого усреднения (балл к RF 14,2 против 13,6), но на маленьких данных
+    промахивается (house: 7,8 против 14,0). Их среднее дало 14,4 и не проваливается."""
+    oof, test_pred = (a.oof + b.oof) / 2, (a.test_pred + b.test_pred) / 2
+    mask, y = a.oof_mask, np.asarray(y)
+    score = evaluate(metric, y[mask], oof[mask], classes)
+    fold_scores = [safe_evaluate(metric, y[va], oof[va], classes) for _, va in folds.splits]
+    log.info("ensemble: среднее Caruana и усреднения, %s OOF %.5f", metric, score)
+    return CoreResult(oof, mask, test_pred, score, fold_scores, 0)
+
+
 def mean_blend(candidates: dict[str, CoreResult], y, metric: str, classes: list, folds) -> CoreResult | None:
     """Среднее вероятностей всех кандидатов для классификации. На holdout со сдвигом классов
     (cls_shift) Caruana по OOF выбрал один xgb и после множителей классов дал F1 0,570, среднее —
