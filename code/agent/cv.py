@@ -32,14 +32,23 @@ class Folds:
     periods: np.ndarray | None = None
 
 
+# Сколько периодов должно остаться в обучении, когда последний уходит на early stopping.
+MIN_FIT_PERIODS = 2
+
+
 def inner_split(folds: Folds, tr: np.ndarray, share: float = INNER_SHARE) -> tuple[np.ndarray, np.ndarray]:
     """Делим train-часть фолда на обучение и early stopping. Останавливаться по val
     фолда нельзя: OOF тогда оптимистичен (на регрессии на 2,6 RMSE).
-    Режем так же, как устроен сам фолд: последний период, группы или случайно."""
+    Режем так же, как устроен сам фолд: последний период, группы или случайно.
+
+    Последний период отрезаем, только если для обучения остаётся минимум MIN_FIT_PERIODS.
+    Иначе в обучении один самый ранний период, у которого нет прошлого, и признаки истории
+    сущности на фолде пустые: на reg_h4 (3 года) история отклонялась как бесполезная, хотя
+    одно «значение прошлого года» давало RMSE 23 против 40 у модели."""
     rng = np.random.default_rng(SEED)
     if folds.periods is not None:
         p = folds.periods[tr]
-        if len(np.unique(p)) >= 2:
+        if len(np.unique(p)) > MIN_FIT_PERIODS:
             last = p == p.max()
             return tr[~last], tr[last]
     if folds.groups is not None:
