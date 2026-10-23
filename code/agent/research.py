@@ -14,11 +14,14 @@
 """
 
 import builtins
+import io
 import json
 import logging
+import multiprocessing as mp
+import os
+import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
+import tokenize
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -51,8 +54,13 @@ PARAM_RANGES = {"learning_rate": (0.01, 0.2), "num_leaves": (4, 512), "min_child
 # тратила на него 18 гипотез из 25. Ограничиваем число попыток.
 MAX_PARAM_TRIALS = 6
 INT_PARAMS = ("num_leaves", "min_child_samples", "max_depth", "max_bin", "min_data_per_group")
-FORBIDDEN_CODE = ("import", "__", "open(", "exec", "eval", "compile", "globals", "locals", "getattr",
-                  "setattr", "os.", "sys.", "subprocess", "read_csv", "to_csv")
+FORBIDDEN_NAMES = {"import", "exec", "eval", "compile", "globals", "locals", "vars", "getattr", "setattr",
+                   "delattr", "open", "os", "sys", "subprocess", "input", "breakpoint", "memoryview"}
+# Методы pandas и numpy, которые читают или пишут файлы (read_* ловится по префиксу).
+FILE_METHODS = {"to_csv", "to_json", "to_pickle", "to_parquet", "to_excel", "to_sql", "to_hdf", "to_feather",
+                "to_stata", "to_html", "to_latex", "to_clipboard", "load", "save", "savez", "savez_compressed",
+                "savetxt", "loadtxt", "genfromtxt", "fromfile", "tofile", "memmap", "pickle", "dump"}
+SEED = 0
 SAFE_BUILTINS = {k: getattr(builtins, k) for k in (
     "abs", "min", "max", "len", "range", "float", "int", "str", "round", "sum", "zip", "enumerate",
     "list", "dict", "set", "tuple", "isinstance", "bool", "sorted", "any", "all", "map", "filter",
@@ -213,23 +221,73 @@ DEFAULTS_NOTE = ("none (defaults: learning_rate 0.05, num_leaves 63, min_child_s
                  "bagging_fraction 0.8, lambda_l2 1)")
 
 
+def check_code(code: str) -> list[str]:
+    """Запрещённые имена в коде LLM. Смотрим токены, а не текст: имя колонки в кавычках
+    («import_share») не должно отклонять гипотезу."""
+    bad = set()
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError) as error:
+        return [f"синтаксис: {error}"]
+    for tok in tokens:
+        if tok.type != tokenize.NAME:
+            continue
+        name = tok.string
+        if name in FORBIDDEN_NAMES or name.startswith("__") or name.startswith("read_") or name in FILE_METHODS:
+            bad.add(name)
+    return sorted(bad)
+
+
+def _sandbox(code: str, frame: pd.DataFrame, conn) -> None:
+    """Выполняется в дочернем процессе: зависание или порча файлов не задевают агента."""
+    try:
+        os.chdir(tempfile.mkdtemp(prefix="llm_feature_"))
+        namespace = {"np": np, "pd": pd, "__builtins__": SAFE_BUILTINS}
+        exec(compile(code, "<llm_feature>", "exec"), namespace)  # noqa: S102 — песочница без импортов и builtins
+        fn = namespace.get("feature")
+        if not callable(fn):
+            raise ValueError("в коде нет функции feature(df)")
+        out = fn(frame)
+        # Series с чужим индексом (groupby без transform) не должна молча сдвинуться: выравниваем.
+        values = out.reindex(frame.index).to_numpy() if isinstance(out, pd.Series) else np.asarray(out).ravel()
+        conn.send(("ok", values))
+    except BaseException as error:  # noqa: BLE001 — любая ошибка кода LLM уходит родителю текстом
+        conn.send(("error", f"{type(error).__name__}: {str(error)[:300]}"))
+    finally:
+        conn.close()
+
+
 def run_code(code: str, frame: pd.DataFrame) -> pd.Series:
-    lowered = code.lower()
-    bad = [w for w in FORBIDDEN_CODE if w in lowered]
+    bad = check_code(code)
     if bad:
         raise ValueError(f"запрещённые конструкции в коде: {bad}")
-    namespace = {"np": np, "pd": pd, "__builtins__": SAFE_BUILTINS}
-    exec(compile(code, "<llm_feature>", "exec"), namespace)  # noqa: S102 — песочница без импортов и builtins
-    fn = namespace.get("feature")
-    if not callable(fn):
-        raise ValueError("в коде нет функции feature(df)")
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn, frame.copy())
-        try:
-            out = future.result(timeout=CODE_TIMEOUT_S)
-        except FutureTimeout:
+    # Строки перемешиваем: в frame сначала train, потом test, и по позиции их можно различить.
+    order = np.random.default_rng(SEED).permutation(len(frame))
+    shuffled = frame.iloc[order].reset_index(drop=True)
+    method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+    ctx = mp.get_context(method)
+    parent, child = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_sandbox, args=(code, shuffled, child), daemon=True)
+    proc.start()
+    child.close()
+    try:
+        if not parent.poll(CODE_TIMEOUT_S):
             raise ValueError(f"код не уложился в {CODE_TIMEOUT_S} с")
-    return pd.Series(np.asarray(out).ravel() if not isinstance(out, pd.Series) else out.to_numpy())
+        status, payload = parent.recv()
+    except EOFError:
+        raise ValueError("процесс с кодом упал без ответа (память?)") from None
+    finally:
+        if proc.is_alive():
+            proc.kill()
+        proc.join(5)
+    if status != "ok":
+        raise ValueError(payload)
+    values = np.asarray(payload).ravel()
+    if len(values) != len(frame):
+        raise ValueError(f"длина признака {len(values)} вместо {len(frame)}")
+    restored = np.empty(len(frame), dtype=values.dtype)
+    restored[order] = values
+    return pd.Series(restored)
 
 
 def make_feature(action: str, cols: list[str], group_by: str | None, code: str | None,
@@ -278,8 +336,10 @@ def parse_params(text) -> dict:
 
 
 def validate(action: str, cols: list[str], group_by: str | None, code: str | None, columns: set[str],
-             params: dict | None = None) -> str | None:
+             params: dict | None = None, protected: set | None = None) -> str | None:
     """Текст ошибки или None. Проверяем имена до того, как что-то считать."""
+    if action in ("drop", "as_category") and protected and set(cols) & protected:
+        return f"колонки {sorted(set(cols) & protected)} нужны валидации и истории сущности, их не трогаем"
     if action == "params":
         return None if params else "нет допустимых параметров или исчерпан лимит попыток: предложи признак"
     unknown = [c for c in cols + ([group_by] if group_by else []) if c not in columns]
@@ -329,7 +389,8 @@ def critique(llm: LLM, trial: Trial, journal: list[Trial], target: str) -> tuple
 
 
 def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictionary: pd.DataFrame | None,
-                  evaluate_stage, deadline: float, journal_path: Path, plan: str = "") -> list[Trial]:
+                  evaluate_stage, deadline: float, journal_path: Path, plan: str = "",
+                  protected: set | None = None) -> list[Trial]:
     """evaluate_stage(name, train, test, params) -> (принят ли, скор кандидата): оценивает вариант
     признаков и параметров и, если он выиграл по правилу принятия, делает его текущим (и пишет сабмит)."""
     journal: list[Trial] = []
@@ -359,7 +420,7 @@ def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictio
         trial = Trial(it, str(answer.get("hypothesis", ""))[:500], action, cols, group_by, code, "invalid", None,
                       before, params=params)
         error = "неизвестное действие" if action not in ACTIONS else validate(action, cols, group_by, code,
-                                                                                  set(features), params)
+                                                                                  set(features), params, protected)
         if error is None:
             run, reason = critique(llm, trial, journal, spec.target)
             if not run:

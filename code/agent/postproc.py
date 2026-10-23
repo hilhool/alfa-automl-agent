@@ -7,6 +7,7 @@
 """
 
 import logging
+import time
 
 import numpy as np
 
@@ -19,7 +20,7 @@ PASSES = 3
 TUNED_METRICS = ("f1_macro", "f1_weighted", "f1_binary", "balanced_accuracy", "mcc", "kappa", "qwk")
 
 
-def fit_weights(y, proba: np.ndarray, classes: list, metric: str) -> np.ndarray:
+def fit_weights(y, proba: np.ndarray, classes: list, metric: str, deadline: float | None = None) -> np.ndarray:
     w = np.ones(proba.shape[1])
     best = evaluate(metric, y, proba * w, classes)
     for _ in range(PASSES):
@@ -32,13 +33,15 @@ def fit_weights(y, proba: np.ndarray, classes: list, metric: str) -> np.ndarray:
                 if s > best + 1e-6:
                     best, base, improved = s, w[j], True
             w[j] = base
+            if deadline is not None and time.monotonic() > deadline:
+                return w / w.max()
         if not improved:
             break
     return w / w.max()
 
 
 def class_weights(y, oof: np.ndarray, mask: np.ndarray, fold_of: np.ndarray, classes: list,
-                  metric: str) -> np.ndarray | None:
+                  metric: str, deadline: float | None = None) -> np.ndarray | None:
     """Множители классов или None, если на перекрёстной проверке они не помогли."""
     if metric not in TUNED_METRICS:
         return None
@@ -48,11 +51,11 @@ def class_weights(y, oof: np.ndarray, mask: np.ndarray, fold_of: np.ndarray, cla
     other = np.isin(fold_of, folds[1::2]) & mask
     gains = []
     for a, b in ((half, other), (other, half)):
-        w = fit_weights(y[a], oof[a], classes, metric)
+        w = fit_weights(y[a], oof[a], classes, metric, deadline)
         gains.append(evaluate(metric, y[b], oof[b] * w, classes) - evaluate(metric, y[b], oof[b], classes))
     log.info("postproc: прирост от весов классов на чужой половине фолдов %s", np.round(gains, 4))
     if min(gains) <= 0:
         return None
-    w = fit_weights(y[mask], oof[mask], classes, metric)
+    w = fit_weights(y[mask], oof[mask], classes, metric, deadline)
     log.info("postproc: веса классов %s", dict(zip(map(str, classes), w.round(2))))
     return w

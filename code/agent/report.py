@@ -65,11 +65,13 @@ class Report:
         if self.trials:
             accepted = sum(t.status == "accepted" for t in self.trials)
             out += ["", f"## Гипотезы LLM ({len(self.trials)}, принято {accepted})", "",
-                    "| # | Действие | Гипотеза | Итог | Скор | Было | Примечание |", "|---|---|---|---|---|---|---|"]
+                    "| # | Наблюдение | Действие | Гипотеза | Итог | Скор | Было | Примечание |",
+                    "|---|---|---|---|---|---|---|---|"]
             for t in self.trials:
                 what = f"{t.action} {t.columns}" + (f" по {t.group_by}" if t.group_by else "") + (
                     f" {t.params}" if t.params else "")
-                out.append(f"| {t.iteration} | {_cell(what)} | {_cell(t.hypothesis[:300])} | {t.status} | "
+                out.append(f"| {t.iteration} | {_cell(getattr(t, 'observation', '')[:300])} | {_cell(what)} | "
+                           f"{_cell(t.hypothesis[:300])} | {t.status} | "
                            f"{_num(t.score)} | {_num(t.before)} | {_cell(t.note[:150])} |")
         if self.models:
             out += ["", "## Кандидаты зоопарка (OOF)", "", "| Модель | Скор | По фолдам |", "|---|---|---|"]
