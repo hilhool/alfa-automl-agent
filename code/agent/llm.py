@@ -24,7 +24,9 @@ TIMEOUT_S = 120
 MAX_TOKENS = 8000
 REASONING_TRIES = ({"effort": "low"}, {"enabled": False})
 RETRIES = 2
-MAX_FAILURES = 4          # подряд упавших вызовов — выключаемся до конца прогона
+MAX_FAILURES = 4          # подряд упавших попыток — выключаемся до конца прогона
+# Окончательные ошибки: ключ не тот или доступа нет. Повторять бессмысленно.
+FATAL_ERRORS = ("AuthenticationError", "PermissionDeniedError", "NotFoundError")
 THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
 JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
@@ -56,12 +58,14 @@ class LLM:
             return None
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         tries = REASONING_TRIES[-1:] * RETRIES if fast else REASONING_TRIES[:RETRIES]
+        format_failed = False
         for attempt, reasoning in enumerate(tries):
             started = time.monotonic()
             try:
                 response = self.client.chat.completions.create(
                     model=self.model, messages=messages, max_tokens=MAX_TOKENS, temperature=0.7,
-                    response_format={"type": "json_schema", "json_schema": {"name": name, "schema": schema}},                    extra_body={"reasoning": reasoning})
+                    response_format={"type": "json_schema", "json_schema": {"name": name, "schema": schema}},
+                    extra_body={"reasoning": reasoning})
                 self.calls += 1
                 if response.usage:
                     self.tokens += response.usage.total_tokens or 0
@@ -75,7 +79,19 @@ class LLM:
                 log.info("llm: в ответе нет полей %s, попытка %d", missing, attempt + 1)
             except Exception as error:
                 log.info("llm: ошибка %s: %s", type(error).__name__, str(error)[:200])
-        self.failures += 1
+                if type(error).__name__ in FATAL_ERRORS:
+                    self.failures = MAX_FAILURES
+                    log.info("llm: окончательная ошибка, работаем без LLM")
+                    return None
+                # Считаем каждую попытку: при недоступном API иначе до выключения уходило
+                # 4 вызова × 2 попытки × 120 с, около 16 минут.
+                self.failures += 1
+                if not self.enabled:
+                    return None
+                continue
+            format_failed = True
+        # Ответ пришёл, но без нужных полей: один сбой на вызов, а не на попытку.
+        self.failures += int(format_failed)
         return None
 
 
@@ -88,7 +104,8 @@ def parse_json(text: str) -> dict | None:
     if start < 0 or end <= start:
         return None
     try:
-        value = json.loads(text[start:end + 1])
+        # strict=False: перевод строки внутри поля code — обычное дело для кода от LLM.
+        value = json.loads(text[start:end + 1], strict=False)
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None

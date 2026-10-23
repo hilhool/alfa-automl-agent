@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent.adversarial import adversarial  # noqa: E402
 from agent.analyst import Plan, analyze, profile, verify  # noqa: E402
-from agent.core import LOG_METRICS, CoreResult, OutOfTime, run_core  # noqa: E402
+from agent.core import LOG_METRICS, CoreResult, OutOfTime, default_transform, encode_target, run_core  # noqa: E402
 from agent.cv import Folds, make_folds  # noqa: E402
 from agent.ensemble import caruana, hedge_blend, mean_blend, median_blend  # noqa: E402
 from agent.entity import add_history, add_lags, find_key  # noqa: E402
@@ -32,7 +32,7 @@ from agent.llm import LLM  # noqa: E402
 from agent.postproc import class_weights  # noqa: E402
 from agent.report import Report  # noqa: E402
 from agent.research import ask_metric, research_loop  # noqa: E402
-from agent.spec import KIND_OF_METRIC, PROBA_METRICS, TaskSpec, find_metric, parse  # noqa: E402
+from agent.spec import BINARY_TO_MULTI, KIND_OF_METRIC, PROBA_METRICS, TaskSpec, find_metric, parse  # noqa: E402
 from agent.taskio import check_submission, locate, write_atomic  # noqa: E402
 from agent.text import find_text_columns, text_features  # noqa: E402
 
@@ -67,6 +67,10 @@ ZOO = [
     # Медленная и точная конфигурация в конце: если времени не хватит, теряем только её.
     ("lgb_fine", "lgb", dict(learning_rate=0.01, num_leaves=31, min_child_samples=20, feature_fraction=0.7)),
 ]
+# Подбор множителей классов заканчиваем не позже этого срока: лимит платформы 3 часа.
+POSTPROC_DEADLINE_S = 170 * 60
+# Медленные модели зоопарка идут после всех быстрых.
+SLOW_MODELS = ("cat", "lgb_fine")
 # Сдвиг train/test: adversarial AUC выше порога. На проверочном наборе случайные сплиты дают
 # 0,49–0,54, публичные задачи и holdout со сдвигом — 0,89–1,0.
 SHIFT_AUC = 0.7
@@ -113,7 +117,8 @@ def save(sub: pd.DataFrame, test: pd.DataFrame, sample: pd.DataFrame, classes: s
 
 
 def wins(metric: str, new: CoreResult, old: CoreResult) -> bool:
-    """Новый вариант лучше в среднем хотя бы на MIN_REL_GAIN и не хуже минимум на 70% фолдов.
+    """Новый вариант лучше в среднем хотя бы на MIN_REL_GAIN и не хуже минимум на 70% фолдов
+    (но один проигранный фолд допустим всегда).
     Ничья не проигрыш: у признаков по прошлому на самом раннем периоде пусто, и там фолд
     совпадает до знака. Порог нужен против шума: лаги дали +0,05% по OOF и −2,5 RMSE на holdout."""
     pairs = [(a, b) for a, b in zip(new.fold_scores, old.fold_scores) if np.isfinite(a) and np.isfinite(b)]
@@ -125,7 +130,11 @@ def wins(metric: str, new: CoreResult, old: CoreResult) -> bool:
     margin = MIN_REL_GAIN * abs(old.score) if not GREATER_IS_BETTER[metric] else MIN_ERR_GAIN * max(1 - old.score, 0)
     # Штрафуем новый вариант на margin: он должен выиграть с запасом.
     shifted = new.score - margin if GREATER_IS_BETTER[metric] else new.score + margin
-    return better(metric, shifted, old.score) and 1 - np.mean(worse) >= MIN_FOLD_WIN_SHARE
+    # Один проигранный фолд разрешён всегда: при трёх фолдах «не хуже на 70%» значило «выиграй все
+    # три», и отклонялись гипотезы со средним выигрышем 2–4% (reg_h5), а при пяти фолдах один
+    # проигрыш и так разрешён.
+    allowed = max(1, int((1 - MIN_FOLD_WIN_SHARE) * len(pairs)))
+    return better(metric, shifted, old.score) and sum(worse) <= allowed
 
 
 def fold_index(folds: Folds, n: int) -> np.ndarray:
@@ -135,11 +144,25 @@ def fold_index(folds: Folds, n: int) -> np.ndarray:
     return fold_of
 
 
+def read_dictionary(path: Path | None) -> pd.DataFrame | None:
+    """Словарь данных не обязателен: кривая кодировка или другой разделитель в private
+    не должны ронять ядро до константы."""
+    if not path:
+        return None
+    for kwargs in ({}, {"sep": None, "engine": "python"}, {"encoding": "cp1251", "sep": None, "engine": "python"}):
+        try:
+            return pd.read_csv(path, **kwargs)
+        except Exception:
+            continue
+    log.warning("data_dictionary не читается, идём без описаний колонок")
+    return None
+
+
 def with_text(train: pd.DataFrame, test: pd.DataFrame, features: list[str], spec: TaskSpec, folds: Folds,
               dictionary_path: Path | None) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Текстовые колонки заменяем OOF текстовой модели. Не вышло — просто выбрасываем их:
     как category они только тормозят бустинг."""
-    dictionary = pd.read_csv(dictionary_path) if dictionary_path else None
+    dictionary = read_dictionary(dictionary_path)
     text_cols = find_text_columns(train, features, dictionary)
     if not text_cols:
         return train, test, features
@@ -186,10 +209,12 @@ def main(task_path: Path) -> None:
         llm = LLM()
         if find_metric(files.task_text) is None and llm.enabled:
             allowed = [m for m in GREATER_IS_BETTER
-                       if (KIND_OF_METRIC.get(m) == "regression") == (spec.kind == "regression")]
+                       if (KIND_OF_METRIC.get(m) == "regression") == (spec.kind == "regression")
+                       and not (spec.kind == "multiclass" and m in BINARY_TO_MULTI)]
             metric = ask_metric(llm, files.task_text, spec.kind, allowed)
             if metric:
-                spec.metric = metric
+                # f1_binary на мультиклассе роняет ядро: только метрики, применимые к типу задачи.
+                spec.metric = BINARY_TO_MULTI.get(metric, metric) if spec.kind == "multiclass" else metric
                 spec.proba_output = (spec.kind == "binary" and metric in PROBA_METRICS
                                      and pd.api.types.is_numeric_dtype(sample[target]))
         log.info("spec: %s", spec)
@@ -223,11 +248,7 @@ def main(task_path: Path) -> None:
     except Exception:
         log.exception("adversarial validation упала, идём дальше")
 
-    dictionary = None
-    try:
-        dictionary = pd.read_csv(files.data_dictionary) if files.data_dictionary else None
-    except Exception:
-        log.exception("data_dictionary не читается")
+    dictionary = read_dictionary(files.data_dictionary)
 
     # Аналитик до моделирования: понимание задачи, роли колонок, риски и идеи для цикла гипотез.
     plan = Plan()
@@ -295,15 +316,21 @@ def main(task_path: Path) -> None:
         return attempt(what, lambda: Stage(tr, te, run_core(tr, te, spec, folds, params, name=what,
                                                            deadline=research_deadline + 10 * 60), None, params))
 
+    # Колонки, без которых ломаются валидация по времени и история сущности: их не удаляют
+    # ни аналитик, ни цикл гипотез.
+    protected = {c for c in [folds.period_col, *(key.cols if key is not None else [])] if c}
+
     # План аналитика: роли колонок, которые подтвердило правило, проверяем на фолдах.
     if plan.summary:
         plan = verify(plan, state.train, state.test, features, folds.period_col, key)
-        useless = [c for c, r in plan.confirmed.items() if r in ("id", "leak", "noise") and c in state.train]
+        useless = [c for c, r in plan.confirmed.items() if r in ("id", "leak", "noise") and c in state.train
+                   and c not in protected]
         if useless:
             keep = [c for c in state.train.columns if c not in useless]
             evaluate_stage(f"analyst: убрать {useless}", state.train[keep],
                            state.test[[c for c in keep if c in state.test]], state.params)
-        codes = [c for c, r in plan.confirmed.items() if r == "category_code" and c in state.train]
+        codes = [c for c, r in plan.confirmed.items() if r == "category_code" and c in state.train
+                 and c not in protected]
         if codes:
             def as_cat(frame: pd.DataFrame) -> pd.DataFrame:
                 return frame.assign(**{c: frame[c].astype("string") for c in codes})
@@ -316,7 +343,7 @@ def main(task_path: Path) -> None:
         try:
             report.trials = research_loop(llm, state, spec, folds, files.task_text, dictionary, evaluate_stage,
                                           research_deadline, files.task_dir / "agent_journal.jsonl",
-                                          plan.as_prompt())
+                                          plan.as_prompt(), base_columns=features, protected=protected)
         except Exception:
             log.exception("research упал, идём дальше с тем, что есть")
         report.write()
@@ -337,7 +364,7 @@ def main(task_path: Path) -> None:
         transforms = ["log1p"] if spec.metric in LOG_METRICS else [None, "log1p"]
     forward = folds.scheme == "time_forward"
     extra = {}
-    if forward:
+    if forward and folds.period_col in state.train:
         last = state.train[folds.period_col] == state.train[folds.period_col].max()
         extra = dict(refit_mult=FORWARD_REFIT_MULT, repeats=np.where(last, LAST_PERIOD_REPEATS, 1))
     residual = "ent_last" if spec.kind == "regression" and "ent_last" in state.train.columns else None
@@ -383,9 +410,18 @@ def main(task_path: Path) -> None:
             log.exception("промежуточный ансамбль упал")
 
     deadline = started + ZOO_DEADLINE_S
-    plan = [(f"{name}+{t}" if t else name, family, params, t) for t in transforms
-            for name, family, params in [("lgb", "lgb", {})] + ZOO]
+    # Медленные модели в конце плана: если время кончится, теряем их, а не быстрые.
+    models = [("lgb", "lgb", {})] + ZOO
+    fast = [m for m in models if m[0] not in SLOW_MODELS]
+    slow = [m for m in models if m[0] in SLOW_MODELS]
+    plan = [(f"{name}+{t}" if t else name, family, params, t) for group in (fast, slow) for t in transforms
+            for name, family, params in group]
+    core_transform = default_transform(spec, encode_target(state.train[spec.target], spec))
     for name, family, params, transform in plan:
+        # Без валидации по времени lgb с параметрами ядра и его же преобразованием таргета —
+        # это само ядро: s_letter тратил на повтор 149 из 1066 с.
+        if (not forward and name.split("+")[0] == "lgb" and transform == core_transform):
+            continue
         if family == "cat" and spec.kind == "multiclass" and len(spec.classes) > MAX_CAT_CLASSES:
             log.info("zoo: %s пропускаем, %d классов", name, len(spec.classes))
             continue
@@ -398,7 +434,8 @@ def main(task_path: Path) -> None:
             candidates[name] = run_core(state.train, state.test, spec, folds, params, family, transform,
                                         min(deadline, time.monotonic() + MODEL_MAX_S), name, seeds=REFIT_SEEDS,
                                         **extra)
-            if residual:
+            # Остаток к прошлому значению только для деревьев: linear+resid давал RMSE 208–367.
+            if residual and family != "linear":
                 candidates[name + "+resid"] = run_core(
                     state.train, state.test, spec, folds, params, family, transform,
                     min(deadline, time.monotonic() + MODEL_MAX_S), name + "+resid", residual_of=residual,
@@ -435,7 +472,8 @@ def main(task_path: Path) -> None:
     if spec.kind != "regression" and not spec.proba_output:
         try:
             weights = class_weights(train[spec.target], state.result.oof, state.result.oof_mask,
-                                    fold_index(folds, len(train)), spec.classes, spec.metric)
+                                    fold_index(folds, len(train)), spec.classes, spec.metric,
+                                    started + POSTPROC_DEADLINE_S)
             if weights is not None:
                 submit(state.result, "веса классов", weights)
                 report.step("множители классов под метрику", "принято", None, None)

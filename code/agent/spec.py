@@ -83,7 +83,11 @@ def parse(task_text: str, train: pd.DataFrame, sample: pd.DataFrame) -> TaskSpec
     if kind == "multiclass":
         metric = BINARY_TO_MULTI.get(metric, metric)
 
-    classes = [] if kind == "regression" else sorted(y.unique().tolist(), key=str)
+    # Числовые классы сортируем по значению: строковая сортировка ставит 10 между 1 и 2, и
+    # roc_auc(labels=classes) падает с «labels must be ordered», а QWK считает порядок неверно.
+    values = y.dropna().unique().tolist()
+    numeric = pd.api.types.is_numeric_dtype(y)
+    classes = [] if kind == "regression" else sorted(values) if numeric else sorted(values, key=str)
     # Вероятность пишем для binary, если метрика её требует и шаблон числовой (0/0.0).
     # Мультикласс с вероятностями в одну колонку не записать, там остаются метки.
     proba = (kind == "binary" and metric in PROBA_METRICS

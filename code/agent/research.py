@@ -14,11 +14,14 @@
 """
 
 import builtins
+import io
 import json
 import logging
+import multiprocessing as mp
+import os
+import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
+import tokenize
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -39,6 +42,9 @@ MAX_TASK_CHARS = 2500
 CODE_TIMEOUT_S = 60
 LEAK_CORR = 0.995
 MIN_SLICE_ROWS = 30
+MISSING = -1e30   # пропуск для дерева по остаткам: порог ниже половины значит «пропущено»
+# Действия, которые смотрят на другие строки: с производными колонками истории они дают утечку.
+CROSS_ROW_ACTIONS = ("group_mean", "group_std", "group_count", "freq", "code")
 ACTIONS = ("ratio", "diff", "product", "group_mean", "group_std", "group_count", "freq", "drop", "as_category",
            "params", "code")
 # Гиперпараметры LightGBM, которые LLM может менять, и их допустимые границы.
@@ -51,8 +57,13 @@ PARAM_RANGES = {"learning_rate": (0.01, 0.2), "num_leaves": (4, 512), "min_child
 # тратила на него 18 гипотез из 25. Ограничиваем число попыток.
 MAX_PARAM_TRIALS = 6
 INT_PARAMS = ("num_leaves", "min_child_samples", "max_depth", "max_bin", "min_data_per_group")
-FORBIDDEN_CODE = ("import", "__", "open(", "exec", "eval", "compile", "globals", "locals", "getattr",
-                  "setattr", "os.", "sys.", "subprocess", "read_csv", "to_csv")
+FORBIDDEN_NAMES = {"import", "exec", "eval", "compile", "globals", "locals", "vars", "getattr", "setattr",
+                   "delattr", "open", "os", "sys", "subprocess", "input", "breakpoint", "memoryview"}
+# Методы pandas и numpy, которые читают или пишут файлы (read_* ловится по префиксу).
+FILE_METHODS = {"to_csv", "to_json", "to_pickle", "to_parquet", "to_excel", "to_sql", "to_hdf", "to_feather",
+                "to_stata", "to_html", "to_latex", "to_clipboard", "load", "save", "savez", "savez_compressed",
+                "savetxt", "loadtxt", "genfromtxt", "fromfile", "tofile", "memmap", "pickle", "dump"}
+SEED = 0
 SAFE_BUILTINS = {k: getattr(builtins, k) for k in (
     "abs", "min", "max", "len", "range", "float", "int", "str", "round", "sum", "zip", "enumerate",
     "list", "dict", "set", "tuple", "isinstance", "bool", "sorted", "any", "all", "map", "filter",
@@ -61,6 +72,7 @@ SAFE_BUILTINS = {k: getattr(builtins, k) for k in (
 SCHEMA = {
     "type": "object",
     "properties": {
+        "observation": {"type": "string"},
         "hypothesis": {"type": "string"},
         "action": {"type": "string", "enum": list(ACTIONS)},
         "columns": {"type": "array", "items": {"type": "string"}},
@@ -70,7 +82,7 @@ SCHEMA = {
     },
     # code, group_by и params обязательны (пустая строка, если не нужны): необязательные поля модель
     # опускает, и все гипотезы с кодом приходили без кода.
-    "required": ["hypothesis", "action", "columns", "group_by", "code", "params"],
+    "required": ["observation", "hypothesis", "action", "columns", "group_by", "code", "params"],
 }
 CRITIC_SCHEMA = {"type": "object", "properties": {"run": {"type": "boolean"}, "reason": {"type": "string"}},
                  "required": ["run", "reason"]}
@@ -116,11 +128,12 @@ class Trial:
     columns: list
     group_by: str | None
     code: str | None
-    status: str          # accepted | rejected | invalid | error
+    status: str          # accepted | rejected | invalid | error | vetoed | duplicate
     score: float | None
     before: float
     note: str = ""
     params: dict | None = None
+    observation: str = ""   # что LLM заметила в ошибках или журнале и какой эффект ждёт
 
 
 def describe_columns(train: pd.DataFrame, features: list[str], dictionary: pd.DataFrame | None) -> str:
@@ -176,6 +189,52 @@ def error_slices(train: pd.DataFrame, spec: TaskSpec, result) -> str:
     return "\n".join(lines)
 
 
+def residual_rules(train: pd.DataFrame, spec: TaskSpec, result, columns: list[str]) -> list[str]:
+    """Неглубокое дерево на величине ошибки OOF: правила вида «a > 5 и b пропущен: ошибка X на N строках».
+    Срезы по одной категории не видят числовых колонок и сочетаний."""
+    from sklearn.tree import DecisionTreeRegressor
+    mask = result.oof_mask
+    if mask.sum() < 10 * MIN_SLICE_ROWS:
+        return []
+    y = train[spec.target].to_numpy()[mask]
+    if spec.kind == "regression":
+        err = (y.astype(float) - result.oof[mask]) ** 2
+    else:
+        err = (to_labels(result.oof[mask], spec.classes).astype(str) != y.astype(str)).astype(float)
+    x = pd.DataFrame(index=np.arange(mask.sum()))
+    for c in columns[:MAX_PROMPT_COLUMNS]:
+        v = train[c].to_numpy()[mask]
+        if pd.api.types.is_numeric_dtype(train[c]):
+            x[c] = pd.to_numeric(pd.Series(v), errors="coerce").fillna(MISSING).to_numpy()
+        else:
+            x[c] = pd.Series(v).astype("category").cat.codes.to_numpy()
+    tree = DecisionTreeRegressor(max_depth=3, min_samples_leaf=max(MIN_SLICE_ROWS, int(0.01 * len(x))),
+                                 random_state=SEED).fit(x, err)
+    t, overall = tree.tree_, err.mean()
+    rules = []
+
+    def walk(node: int, path: list[str]) -> None:
+        if t.children_left[node] == -1:
+            rules.append((t.value[node][0][0], int(t.n_node_samples[node]), path))
+            return
+        col, thr = x.columns[t.feature[node]], t.threshold[node]
+        if thr < MISSING / 2:
+            left, right = f"{col} is missing", f"{col} is present"
+        elif pd.api.types.is_numeric_dtype(train[col]):
+            left, right = f"{col} <= {thr:.4g}", f"{col} > {thr:.4g}"
+        else:
+            left, right = f"{col} in first {int(thr) + 1} category codes", f"{col} in later category codes"
+        walk(t.children_left[node], path + [left])
+        walk(t.children_right[node], path + [right])
+    walk(0, [])
+    unit = "mean squared error" if spec.kind == "regression" else "error rate"
+    out = []
+    for value, n, path in sorted(rules, reverse=True)[:5]:
+        if value > overall * 1.2:
+            out.append(f"{' and '.join(path)}: {unit} {value:.4g} (overall {overall:.4g}) on {n} rows")
+    return out
+
+
 def build_prompt(task_text: str, spec: TaskSpec, train: pd.DataFrame, features: list[str],
                  dictionary: pd.DataFrame | None, result, scheme: str, journal: list[Trial],
                  plan: str = "", params: dict | None = None) -> str:
@@ -199,6 +258,8 @@ Columns (name | dtype | unique | missing | description):
 
 Where the model errs:
 {error_slices(train, spec, result)}
+Regions found by a shallow tree on OOF errors:
+{chr(10).join(residual_rules(train, spec, result, features)) or "- none stand out"}
 
 Journal of tried hypotheses:
 {history}
@@ -206,30 +267,81 @@ Journal of tried hypotheses:
 {ACTION_HELP}
 
 The target column `{spec.target}` is NOT available to features (no target encoding).
-Propose the single most promising NEW hypothesis."""
+First write `observation`: what in the error slices or the journal motivates the idea and what effect you
+expect (which slice should improve). Then propose the single most promising NEW hypothesis."""
 
 
 DEFAULTS_NOTE = ("none (defaults: learning_rate 0.05, num_leaves 63, min_child_samples 20, feature_fraction 0.8, "
                  "bagging_fraction 0.8, lambda_l2 1)")
 
 
+def check_code(code: str) -> list[str]:
+    """Запрещённые имена в коде LLM. Смотрим токены, а не текст: имя колонки в кавычках
+    («import_share») не должно отклонять гипотезу."""
+    bad = set()
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError) as error:
+        return [f"синтаксис: {error}"]
+    for tok in tokens:
+        if tok.type != tokenize.NAME:
+            continue
+        name = tok.string
+        if name in FORBIDDEN_NAMES or name.startswith("__") or name.startswith("read_") or name in FILE_METHODS:
+            bad.add(name)
+    return sorted(bad)
+
+
+def _sandbox(code: str, frame: pd.DataFrame, conn) -> None:
+    """Выполняется в дочернем процессе: зависание или порча файлов не задевают агента."""
+    try:
+        os.chdir(tempfile.mkdtemp(prefix="llm_feature_"))
+        namespace = {"np": np, "pd": pd, "__builtins__": SAFE_BUILTINS}
+        exec(compile(code, "<llm_feature>", "exec"), namespace)  # noqa: S102 — песочница без импортов и builtins
+        fn = namespace.get("feature")
+        if not callable(fn):
+            raise ValueError("в коде нет функции feature(df)")
+        out = fn(frame)
+        # Series с чужим индексом (groupby без transform) не должна молча сдвинуться: выравниваем.
+        values = out.reindex(frame.index).to_numpy() if isinstance(out, pd.Series) else np.asarray(out).ravel()
+        conn.send(("ok", values))
+    except BaseException as error:  # noqa: BLE001 — любая ошибка кода LLM уходит родителю текстом
+        conn.send(("error", f"{type(error).__name__}: {str(error)[:300]}"))
+    finally:
+        conn.close()
+
+
 def run_code(code: str, frame: pd.DataFrame) -> pd.Series:
-    lowered = code.lower()
-    bad = [w for w in FORBIDDEN_CODE if w in lowered]
+    bad = check_code(code)
     if bad:
         raise ValueError(f"запрещённые конструкции в коде: {bad}")
-    namespace = {"np": np, "pd": pd, "__builtins__": SAFE_BUILTINS}
-    exec(compile(code, "<llm_feature>", "exec"), namespace)  # noqa: S102 — песочница без импортов и builtins
-    fn = namespace.get("feature")
-    if not callable(fn):
-        raise ValueError("в коде нет функции feature(df)")
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn, frame.copy())
-        try:
-            out = future.result(timeout=CODE_TIMEOUT_S)
-        except FutureTimeout:
+    # Строки перемешиваем: в frame сначала train, потом test, и по позиции их можно различить.
+    order = np.random.default_rng(SEED).permutation(len(frame))
+    shuffled = frame.iloc[order].reset_index(drop=True)
+    method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+    ctx = mp.get_context(method)
+    parent, child = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_sandbox, args=(code, shuffled, child), daemon=True)
+    proc.start()
+    child.close()
+    try:
+        if not parent.poll(CODE_TIMEOUT_S):
             raise ValueError(f"код не уложился в {CODE_TIMEOUT_S} с")
-    return pd.Series(np.asarray(out).ravel() if not isinstance(out, pd.Series) else out.to_numpy())
+        status, payload = parent.recv()
+    except EOFError:
+        raise ValueError("процесс с кодом упал без ответа (память?)") from None
+    finally:
+        if proc.is_alive():
+            proc.kill()
+        proc.join(5)
+    if status != "ok":
+        raise ValueError(payload)
+    values = np.asarray(payload).ravel()
+    if len(values) != len(frame):
+        raise ValueError(f"длина признака {len(values)} вместо {len(frame)}")
+    restored = np.empty(len(frame), dtype=values.dtype)
+    restored[order] = values
+    return pd.Series(restored)
 
 
 def make_feature(action: str, cols: list[str], group_by: str | None, code: str | None,
@@ -278,8 +390,10 @@ def parse_params(text) -> dict:
 
 
 def validate(action: str, cols: list[str], group_by: str | None, code: str | None, columns: set[str],
-             params: dict | None = None) -> str | None:
+             params: dict | None = None, protected: set | None = None) -> str | None:
     """Текст ошибки или None. Проверяем имена до того, как что-то считать."""
+    if action in ("drop", "as_category") and protected and set(cols) & protected:
+        return f"колонки {sorted(set(cols) & protected)} нужны валидации и истории сущности, их не трогаем"
     if action == "params":
         return None if params else "нет допустимых параметров или исчерпан лимит попыток: предложи признак"
     unknown = [c for c in cols + ([group_by] if group_by else []) if c not in columns]
@@ -328,17 +442,33 @@ def critique(llm: LLM, trial: Trial, journal: list[Trial], target: str) -> tuple
     return bool(answer.get("run", True)), str(answer.get("reason", ""))[:300]
 
 
+def trial_key(trial: Trial) -> str:
+    """Ключ для поиска повторов: одно действие над теми же колонками с теми же параметрами."""
+    return json.dumps([trial.action, sorted(trial.columns), trial.group_by or "", trial.params or {},
+                       " ".join((trial.code or "").split())], sort_keys=True, ensure_ascii=False)
+
+
 def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictionary: pd.DataFrame | None,
-                  evaluate_stage, deadline: float, journal_path: Path, plan: str = "") -> list[Trial]:
+                  evaluate_stage, deadline: float, journal_path: Path, plan: str = "",
+                  base_columns: list[str] | None = None, protected: set | None = None) -> list[Trial]:
     """evaluate_stage(name, train, test, params) -> (принят ли, скор кандидата): оценивает вариант
-    признаков и параметров и, если он выиграл по правилу принятия, делает его текущим (и пишет сабмит)."""
+    признаков и параметров и, если он выиграл по правилу принятия, делает его текущим (и пишет сабмит).
+
+    base_columns — исходные колонки задачи. Агрегаты по многим строкам (group_*, freq, свой код)
+    строятся только из них и из признаков самого цикла: среднее ent_last по группе при валидации
+    по времени захватывает строки следующего периода, а их ent_last равен таргету текущей строки,
+    и гипотеза выигрывает CV за счёт утечки (reg_h5: OOF 49,5 → 48,0, holdout хуже). Построчные
+    действия над производными колонками безопасны и разрешены."""
     journal: list[Trial] = []
+    seen: set[str] = set()
     for it in range(MAX_ITERS):
         if not llm.enabled or time.monotonic() > deadline:
             log.info("research: стоп на итерации %d (llm %s, время %s)", it, llm.enabled,
                      time.monotonic() > deadline)
             break
         features = [c for c in state.train.columns if c not in (spec.id_col, spec.target)]
+        derived = set() if base_columns is None else {c for c in features if c not in base_columns
+                                                      and not c.startswith("llm_")}
         before = state.result.score
         prompt = build_prompt(task_text, spec, state.train, features, dictionary, state.result,
                               folds.scheme, journal, plan, state.params)
@@ -357,17 +487,26 @@ def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictio
         if action == "params" and sum(t.action == "params" for t in journal) >= MAX_PARAM_TRIALS:
             params = None  # validate отметит гипотезу как invalid, LLM увидит это в журнале
         trial = Trial(it, str(answer.get("hypothesis", ""))[:500], action, cols, group_by, code, "invalid", None,
-                      before, params=params)
+                      before, params=params, observation=str(answer.get("observation", ""))[:500])
         error = "неизвестное действие" if action not in ACTIONS else validate(action, cols, group_by, code,
-                                                                                  set(features), params)
+                                                                                  set(features), params, protected)
+        if error is None and action in CROSS_ROW_ACTIONS and derived & set(cols + ([group_by] if group_by else [])):
+            error = (f"агрегаты по строкам только из исходных колонок, {sorted(derived & set(cols + [group_by]))} "
+                     "производные: построчно (ratio, diff, product) их можно")
+        if error is None and trial_key(trial) in seen:
+            error, trial.status = "повтор уже проверенной гипотезы", "duplicate"
+        seen.add(trial_key(trial))
         if error is None:
             run, reason = critique(llm, trial, journal, spec.target)
             if not run:
                 error, trial.status = f"критик: {reason}", "vetoed"
         if error is None:
             try:
-                accepted, score, note = try_hypothesis(trial, state, spec, features, evaluate_stage)
-                trial.status, trial.score, trial.note = ("accepted" if accepted else "rejected"), score, note
+                accepted, score, note = try_hypothesis(trial, state, spec, features, evaluate_stage, derived)
+                # score None — оценка упала: LLM должна видеть ошибку, а не «проверено и отвергнуто».
+                status = "accepted" if accepted else "rejected" if score is not None else "error"
+                trial.status, trial.score, trial.note = status, score, note or ("" if score is not None
+                                                                                else "оценка на фолдах упала")
             except Exception as exc:  # одна кривая гипотеза не должна останавливать цикл
                 trial.status, trial.note = "error", f"{type(exc).__name__}: {str(exc)[:200]}"
         else:
@@ -386,7 +525,8 @@ def research_loop(llm: LLM, state, spec: TaskSpec, folds, task_text: str, dictio
     return journal
 
 
-def try_hypothesis(trial: Trial, state, spec: TaskSpec, features: list[str], evaluate_stage):
+def try_hypothesis(trial: Trial, state, spec: TaskSpec, features: list[str], evaluate_stage,
+                   derived: set | None = None):
     train, test = state.train, state.test
     if trial.action == "params":
         params = {**(state.params or {}), **trial.params}
@@ -407,7 +547,9 @@ def try_hypothesis(trial: Trial, state, spec: TaskSpec, features: list[str], eva
                                    state.params)
         return ok, score, ""
 
-    frame = pd.concat([train[features], test[features]], ignore_index=True)
+    # Свой код LLM может агрегировать по строкам, поэтому производных колонок истории ему не даём.
+    usable = [c for c in features if not (trial.action == "code" and derived and c in derived)]
+    frame = pd.concat([train[usable], test[usable]], ignore_index=True)
     values = make_feature(trial.action, trial.columns, trial.group_by, trial.code, frame)
     values = pd.to_numeric(pd.Series(np.asarray(values).ravel()), errors="coerce").replace([np.inf, -np.inf], np.nan)
     if len(values) != len(frame):

@@ -194,7 +194,10 @@ def _fit_cat(params, spec, x_fit, y_fit, x_stop, y_stop, to_predict, rounds):
             "binary": "Logloss",
             "multiclass": "MultiClass"}[spec.kind]
     cls = CatBoostRegressor if spec.kind == "regression" else CatBoostClassifier
+    # Plain и Bernoulli — рекомендация документации CatBoost для CPU: он занимал 40–90% прогона
+    # (s_diamonds 597 из 669 с), при этом лучший одиночный кандидат в 5 задачах набора из 14.
     base = {**dict(loss_function=loss, learning_rate=0.08, depth=6, thread_count=N_JOBS, random_seed=0,
+                   boosting_type="Plain", bootstrap_type="Bernoulli", subsample=0.8,
                    verbose=False, allow_writing_files=False), **params}
     x_fit, cats = _cat_frame(x_fit)
     if x_stop is not None:
@@ -383,7 +386,7 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
                 no_base = ~rows[va]
                 oof[va[no_base]] = fallback.oof[va[no_base]]
             rounds.append(r)
-        if spec.kind == "regression":
+        if spec.kind == "regression" and family == "linear":
             # Та же обрезка, что у test (см. ниже), по диапазону train-части фолда.
             oof[va] = np.clip(oof[va], np.nanmin(y[tr]), np.nanmax(y[tr]))
         mask[va] = True
@@ -397,16 +400,18 @@ def run_core(train: pd.DataFrame, test: pd.DataFrame, spec: TaskSpec, folds: Fol
     # периоду (там раундов в 2–4 раза меньше): reg_h5 стал хуже, 28,91 → 29,46, reg_h4 без изменений.
     full_rounds = max(50, int(np.mean(rounds) * refit_mult))
     refit = []
-    for seed in range(max(1, seeds)):
+    # Линейная модель детерминирована: рефит на нескольких seed — потеря времени.
+    for seed in range(1 if family == "linear" else max(1, seeds)):
         if seed > 0 and deadline is not None and time.monotonic() > deadline:
             break
         (pred,), _ = fitter({**params, SEED_KEY[family]: seed}, spec, x.iloc[expand(np.arange(n))],
                             y_model[expand(np.arange(n))], None, None, [x_test], full_rounds)
         refit.append(pred)
     test_pred = restore(np.mean(refit, axis=0), base_te)
-    if spec.kind == "regression":
+    if spec.kind == "regression" and family == "linear":
         # Линейная модель экстраполирует: на house_prices она предсказала 940 тыс. при максимуме
-        # train 755 тыс. Деревья за диапазон train не выходят, обрезка их не меняет.
+        # train 755 тыс. Деревьям и вариантам «на остатке» не режем: при прогнозе следующего
+        # периода выход за диапазон train бывает законным.
         test_pred = np.clip(test_pred, np.nanmin(y), np.nanmax(y))
     if fallback is not None and base_te is not None:
         no_base = np.isnan(base_te)
