@@ -67,6 +67,7 @@ ZOO = [
     # Медленная и точная конфигурация в конце: если времени не хватит, теряем только её.
     ("lgb_fine", "lgb", dict(learning_rate=0.01, num_leaves=31, min_child_samples=20, feature_fraction=0.7)),
 ]
+SKIP_WEIGHTS_UNDER_SHIFT = True
 # Подбор множителей классов заканчиваем не позже этого срока: лимит платформы 3 часа.
 POSTPROC_DEADLINE_S = 170 * 60
 # Сдвиг train/test: adversarial AUC выше порога. На проверочном наборе случайные сплиты дают
@@ -452,7 +453,10 @@ def main(task_path: Path) -> None:
     submit(state.result, "итог")
     report.write()
 
-    if spec.kind != "regression" and not spec.proba_output:
+    # При сдвиге train/test множители не применяем: они подобраны под доли классов train. На публичном
+    # UNSW модель и так отдаёт Normal 35,5% строк при ~45% в test, а множители срезают его до 31%
+    # и уводят предсказанные доли дальше от настоящих (расхождение 0,144 → 0,180).
+    if spec.kind != "regression" and not spec.proba_output and not (robust and SKIP_WEIGHTS_UNDER_SHIFT):
         try:
             weights = class_weights(train[spec.target], state.result.oof, state.result.oof_mask,
                                     fold_index(folds, len(train)), spec.classes, spec.metric,
