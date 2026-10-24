@@ -67,6 +67,7 @@ ZOO = [
     # Медленная и точная конфигурация в конце: если времени не хватит, теряем только её.
     ("lgb_fine", "lgb", dict(learning_rate=0.01, num_leaves=31, min_child_samples=20, feature_fraction=0.7)),
 ]
+SHIFT_WEIGHT_POWER = 1.25
 # Подбор множителей классов заканчиваем не позже этого срока: лимит платформы 3 часа.
 POSTPROC_DEADLINE_S = 170 * 60
 # Сдвиг train/test: adversarial AUC выше порога. На проверочном наборе случайные сплиты дают
@@ -457,6 +458,13 @@ def main(task_path: Path) -> None:
             weights = class_weights(train[spec.target], state.result.oof, state.result.oof_mask,
                                     fold_index(folds, len(train)), spec.classes, spec.metric,
                                     started + POSTPROC_DEADLINE_S)
+            if weights is not None and robust:
+                # При сдвиге train/test редкие классы на test модель отделяет неувереннее, и множители
+                # нужны сильнее. На holdout со сдвигом (cls_shift, два прогона) степень 1,25 дала
+                # +0,005…0,008 macro F1, без сдвига (cls_holdout) сильнее — хуже. На платформе
+                # без множителей скор был на 1,3 ниже, с ослабленными (40d3def) тоже ниже.
+                weights = weights ** SHIFT_WEIGHT_POWER
+                weights = weights / weights.max()
             if weights is not None:
                 submit(state.result, "веса классов", weights)
                 report.step("множители классов под метрику", "принято", None, None)
