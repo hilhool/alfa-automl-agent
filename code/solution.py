@@ -72,6 +72,8 @@ POSTPROC_DEADLINE_S = 170 * 60
 # Сдвиг train/test: adversarial AUC выше порога. На проверочном наборе случайные сплиты дают
 # 0,49–0,54, публичные задачи и holdout со сдвигом — 0,89–1,0.
 SHIFT_AUC = 0.7
+# Сколько самых сдвинутых по adversarial колонок убирать в классификации при сдвиге.
+SHIFT_DROP = 3
 
 
 @dataclass
@@ -240,6 +242,24 @@ def main(task_path: Path) -> None:
         report.facts["Сдвиг train/test"] = f"adversarial AUC {adv.auc:.3f}, сильнее всего {adv.top}"
     except Exception:
         log.exception("adversarial validation упала, идём дальше")
+
+    # Классификация со сдвигом: самые сдвинутые колонки убираем без проверки по фолдам. OOF такой
+    # шаг не видит (на UNSW-NB15 он чуть хуже), а на test с официальным сплитом macro F1 растёт
+    # на 0,007–0,012 на двух выборках. Больше трёх колонок уже вредит (уходят полезные sbytes и т. п.).
+    if (spec.kind != "regression" and folds.scheme != "time_forward" and shift_auc is not None
+            and shift_auc > SHIFT_AUC):
+        drop = [c for c, _ in shifted[:SHIFT_DROP] if c in features]
+        if drop:
+            try:
+                tr, te = train.drop(columns=drop), test.drop(columns=drop)
+                new = run_core(tr, te, spec, folds, name="shift_drop")
+                train, test, best = tr, te, new
+                features = [c for c in features if c not in drop]
+                if save(to_submission(best.test_pred, test, spec), test, sample, classes, files.submission):
+                    log.info("Сдвиг: убрали %s, %s OOF %.5f", drop, spec.metric, best.score)
+                report.step(f"сдвиг: убрать {drop}", "принято без фолдов", best.score, None)
+            except Exception:
+                log.exception("Удаление сдвинутых колонок упало, идём со всеми")
 
     dictionary = read_dictionary(files.data_dictionary)
 
